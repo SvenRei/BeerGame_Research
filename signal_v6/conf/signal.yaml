@@ -1,0 +1,51 @@
+# conf/signal.yaml -- the ONE config. Every knob explicit; no silent couplings.
+# Override on the command line: --set key=value (unknown keys are rejected, fail-closed).
+
+# ----- identity ---------------------------------------------------------------
+tag: ""                 # run tag; empty -> "<content>_s<seed>"
+seed: 60
+
+# ----- treatment (the ONLY thing that varies across arms) ---------------------
+content: nocomm         # nocomm | raw | ip | arpred | dhatc | learned
+topology: retailer_broadcast   # retailer_broadcast | neighbor
+msg_dim: 3              # fixed channel width M across the WHOLE study
+forecaster_path: "assets/forecaster_ar1r9.pt"   # required only for content=dhatc
+
+# ----- environment / axes -----------------------------------------------------
+demand_family: ar1      # ar1 | poisson  (poisson: classic Beer Game, ignores rho)
+rho: 0.9                # V(rho) axis (AR(1) only)
+ar1_mu: 12.0
+ar1_sigma: 3.0
+poisson_mu: 8.0         # demand_family=poisson mean (legacy classic mode)
+beta: 1.0               # V(beta) axis: r_i = -(c_i + beta * sum_others) / 100
+max_order: 100
+
+# ----- agent (registered decisions R1, R5, R6) --------------------------------
+hidden: 256
+act_bins: 41
+s_max: 100.0            # R1: order-up-to grid [0, 100] x 41
+
+# ----- learning (reference recipe; R2-R3) -------------------------------------
+gamma: 0.99
+lr_actor: 0.0003
+lr_critic: 0.001
+lr_step_episodes: 2000  # StepLR x0.5 every 2000 episodes (the reference's stabilizer)
+k_epochs: 4
+eps_clip: 0.1
+max_grad_norm: 0.2
+batch_episodes: 1       # update every episode (reference cadence)
+ent_start: 0.02
+ent_end: 0.0
+anneal_episodes: 8000   # ABSOLUTE -- never derived from total_episodes (banned coupling)
+warm_up: 0              # inert in v6 (on-policy, no running normalizer, nothing stored)
+#                         -- kept as a knob for parity experiments only
+
+# ----- budget (R4: no early stopping; milestones ARE the V(budget) axis) ------
+total_episodes: 8000
+budget_milestones: [1000, 2000, 4000, 8000]
+
+# ----- gates & diagnostics ----------------------------------------------------
+gate_every: 200
+gate_episodes_per_rho: 5   # 15 episodes per gate; 2 made best-checkpoint selection lottery-like
+ev_canary: 0.05         # honest-EV floor; loud warning below this after canary_after
+canary_after: 3000
