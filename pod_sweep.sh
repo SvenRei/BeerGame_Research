@@ -238,6 +238,9 @@ for lab in -3 -4; do
       | tee "runs/stats_OOD_rho${lab}.txt"
 done
 
+echo "== stage 5c: consolidated results sheet =="
+$PY -m signal_lab.collate
+
 echo "== stage 6: hypotheses =="
 $PY -m signal_lab.hypotheses --self-test
 $PY -m signal_lab.hypotheses --stats "runs/stats_rho*.json" || true
@@ -246,7 +249,8 @@ echo "== stage 7: manifest =="
 { date -u +"%Y-%m-%dT%H:%M:%SZ"
   git -C . rev-parse HEAD 2>/dev/null || echo "no-git"
   sha256sum conf/signal.yaml signal_lab/*.py env/beer_game.py vendor/envs/beer_game_env.py \
-            vendor/scripts/demand_families.py scripts/fit_scales.py runs/msg_scales.json
+            vendor/scripts/demand_families.py scripts/fit_scales.py runs/msg_scales.json \
+            runs/RESULTS.csv 2>/dev/null
   echo "cells=$N_CELLS seeds=$N_SEEDS jobs=$N_JOBS episodes=$EPISODES"
 } > runs/CAMPAIGN_MANIFEST.txt
 echo "DONE. Manifest at runs/CAMPAIGN_MANIFEST.txt"

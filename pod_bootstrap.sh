@@ -142,14 +142,16 @@ PYEOF
 # ---------------------------------------------------------------- 7 archive
 step "7/7 archive"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-tar -czf "campaign_${STAMP}.tar.gz" runs/stats_*.json runs/stats_*.txt \
+tar -czf "campaign_${STAMP}.tar.gz" runs/RESULTS.csv runs/RESULTS.md \
+    runs/stats_*.json runs/stats_*.txt \
     runs/CAMPAIGN_MANIFEST.txt runs/msg_scales.json runs/baselines_*.json \
     figs docs 2>/dev/null || true
 sha256sum "campaign_${STAMP}.tar.gz" | tee -a runs/CAMPAIGN_MANIFEST.txt
 echo
 echo "=============================================================="
 echo " COMPLETE  |  $(date -u +%FT%TZ)"
-echo "   results  : runs/stats_*.txt , runs/stats_rho*.json"
+echo "   RESULTS  : runs/RESULTS.md  (read this first) + runs/RESULTS.csv"
+echo "   per-group: runs/stats_*.txt , runs/stats_rho*.json"
 echo "   figures  : figs/"
 echo "   manifest : runs/CAMPAIGN_MANIFEST.txt"
 echo "   archive  : campaign_${STAMP}.tar.gz"

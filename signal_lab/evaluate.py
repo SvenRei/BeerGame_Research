@@ -23,6 +23,13 @@ from signal_lab.train import play_episode  # noqa: E402
 
 EVAL_SEED_BASE = 10_000        # disjoint from train / gate / monitor spaces
 
+# Registered analysis labels for out-of-distribution scenarios. Dumps are keyed by the
+# rho label, so an OOD run MUST use a label disjoint from every in-distribution rho or
+# it would silently overwrite the in-distribution result for that arm. Applied
+# automatically when --scenario is given without an explicit --rho.
+SCENARIO_LABELS = {"black_swan": -3.0, "extreme_chaos": -4.0,
+                   "poisson": -5.0, "ar1": None}
+
 
 def load_checkpoint(path):
     payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -94,7 +101,9 @@ def main(argv=None):
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--episodes", type=int, default=50)
     ap.add_argument("--rho", type=float, default=None,
-                    help="default: the checkpoint's own training rho")
+                    help="analysis label for the dump filename. Default: the "
+                         "checkpoint's own training rho, or the registered label for "
+                         "--scenario (black_swan -3, extreme_chaos -4, poisson -5).")
     ap.add_argument("--intervention", default="honest",
                     choices=("honest", "zeroed", "shuffled", "cross"))
     ap.add_argument("--seed-base", type=int, default=EVAL_SEED_BASE, dest="sb")
@@ -104,6 +113,16 @@ def main(argv=None):
                          "Pair with --rho <label> to keep dumps disjoint "
                          "(convention: -3 black_swan, -4 extreme_chaos).")
     a = ap.parse_args(argv)
+    if a.scenario and a.rho is None:
+        lab = SCENARIO_LABELS.get(a.scenario)
+        if lab is None:
+            raise SystemExit(
+                f"[eval] FAIL-CLOSED: --scenario {a.scenario} has no registered label; "
+                f"pass an explicit --rho <label> disjoint from every in-distribution "
+                f"rho, or the OOD dump would overwrite the in-distribution one.")
+        a.rho = lab
+        print(f"[eval] scenario={a.scenario} -> analysis label rho={lab:g} "
+              f"(registered; keeps OOD dumps disjoint from in-distribution)")
     costs, recs, cfg, rho = evaluate(a.ckpt, a.episodes, a.rho, a.intervention, a.sb,
                                      scenario=a.scenario)
     out_dir = os.path.join(os.path.dirname(os.path.abspath(a.ckpt)), "eval")
