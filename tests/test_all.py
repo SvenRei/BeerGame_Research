@@ -379,6 +379,31 @@ def t_lag():
     print("T-LAG     lag contents exact, episode reset clean OK")
 
 
+def t_ood():
+    """Zero-shot OOD transfer: the scenario swaps the DEMAND ONLY. The policy, the
+    message content and msg_scale must be exactly as trained, and the OOD dumps must
+    not collide with the in-distribution ones."""
+    from env.beer_game import BeerGame
+    from signal_lab.evaluate import evaluate as ev
+    # the stress decks are the vendored ones, and they are genuinely non-stationary
+    for fam, lo_hi in (("black_swan", (10, 25)), ("extreme_chaos", (20, 40))):
+        e = BeerGame({"demand_family": fam}); e.reset(seed=10000)
+        d = [e.step(np.full(4, 8))[3]["demand"] for _ in range(50)]
+        early, late = np.mean(d[:10]), np.mean(d[30:])
+        assert abs(late - early) > 5, (fam, early, late)   # regime really shifts
+    # an ar1-trained checkpoint evaluates OOD without retraining, and the arch echo
+    # must still report the TRAINING msg_scale (no silent recalibration)
+    ck = os.path.join(ROOT, "runs", "_smoke_nocomm_s60", "ckpt_best.pt")
+    if os.path.exists(ck):
+        c_id, _, cfg_id, _ = ev(ck, episodes=2, scenario=None)
+        c_ood, _, cfg_ood, _ = ev(ck, episodes=2, scenario="black_swan")
+        assert cfg_id["msg_scale"] == cfg_ood["msg_scale"], "msg_scale recalibrated OOD"
+        assert cfg_id["content"] == cfg_ood["content"]
+        assert list(c_id.values()) != list(c_ood.values()), \
+            "OOD scenario produced identical costs -- demand swap did not take effect"
+    print("T-OOD     stress decks shift regime; OOD eval swaps demand only OK")
+
+
 def t_smoke():
     tag = "_smoke_nocomm_s60"
     run = os.path.join(ROOT, "runs", tag)
@@ -437,6 +462,6 @@ def t_sweep():
 
 if __name__ == "__main__":
     t_env(); t_arpred(); t_interv(); t_frozen(); t_param(); t_sym(); t_grad()
-    t_stats(); t_dp(); t_p2(); t_geo(); t_lag(); t_smoke(); t_sweep()
+    t_stats(); t_dp(); t_p2(); t_geo(); t_lag(); t_ood(); t_smoke(); t_sweep()
     print("\nALL TESTS PASS -- the arm-symmetry, gradient-isolation, and fail-closed "
           "contracts hold.")

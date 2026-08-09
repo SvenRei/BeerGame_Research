@@ -104,8 +104,10 @@ class _DPCond:
         return self.a + self.b * (lam_hat - self.mid)
 
 
-def fit_cond_dp(cfg, seeds, S0):
-    mid = (float(cfg["dr_lambda_lo"]) + float(cfg["dr_lambda_hi"])) / 2.0
+def fit_cond_dp(cfg, seeds, S0, mid=None):
+    if mid is None:
+        mid = ((float(cfg["dr_lambda_lo"]) + float(cfg["dr_lambda_hi"])) / 2.0
+               if cfg.get("demand_family") == "dr_poisson" else 12.0)
     a_vec, b_vec = S0.astype(float).copy(), np.zeros(N_AGENTS)
     for _ in range(2):
         for i in range(N_AGENTS):
@@ -149,7 +151,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--rho", type=float, default=0.9)
     ap.add_argument("--demand-family", default="ar1",
-                    choices=("ar1", "poisson", "dr_poisson"))
+                    choices=("ar1", "poisson", "dr_poisson",
+                             "black_swan", "extreme_chaos"))
     ap.add_argument("--poisson-mu", type=float, default=8.0)
     ap.add_argument("--fit-episodes", type=int, default=12)
     ap.add_argument("--eval-episodes", type=int, default=50)
@@ -163,9 +166,15 @@ def main(argv=None):
     S, _ = fit_static(cfg, fit_seeds)
     static_ep = _score_per_episode(cfg, eval_seeds, lambda o, d, S=S: S)
     static_cost = float(np.mean(static_ep))
-    if a.demand_family == "dr_poisson":
+    if a.demand_family in ("dr_poisson", "black_swan", "extreme_chaos"):
+        # Non-stationary regimes: condition on a RUNNING estimate of the current level
+        # rather than an AR(1) closed form. For the stress decks this is the
+        # "oracle who fitted to the shock" reference -- deliberately generous, so the
+        # transferred RL policies are measured against a bar that knew the regime.
         av, bv, _ = fit_cond_dp(cfg, fit_seeds, S)
-        _cond_fn = _DPCond(av, bv, (cfg["dr_lambda_lo"] + cfg["dr_lambda_hi"]) / 2.0)
+        _mid = ((cfg["dr_lambda_lo"] + cfg["dr_lambda_hi"]) / 2.0
+                if a.demand_family == "dr_poisson" else 12.0)
+        _cond_fn = _DPCond(av, bv, _mid)
     else:
         av, bv, _ = fit_cond(cfg, fit_seeds, S)
         mu, rho = float(cfg["ar1_mu"]), a.rho

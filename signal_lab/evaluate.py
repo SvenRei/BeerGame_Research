@@ -51,7 +51,11 @@ def load_checkpoint(path):
 
 
 def evaluate(ckpt_path, episodes=50, rho=None, intervention="honest",
-             seed_base=EVAL_SEED_BASE):
+             seed_base=EVAL_SEED_BASE, scenario=None):
+    """scenario: zero-shot OOD transfer. Overrides the DEMAND PROCESS only -- the
+    policy, the message content, and msg_scale all stay exactly as trained. The
+    divisor is deliberately NOT re-measured on the new regime: recalibrating it would
+    presume knowledge of a shift the agent is not supposed to have."""
     actor, _, provider, cfg = load_checkpoint(ckpt_path)
     if intervention != "honest":
         provider = InterventionWrapper(provider, intervention, seed=seed_base)
@@ -59,7 +63,7 @@ def evaluate(ckpt_path, episodes=50, rho=None, intervention="honest",
     env = BeerGame({"dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
                     "dr_lambda_hi": cfg.get("dr_lambda_hi", 24.0),
                     "obs_order_clip": cfg.get("obs_order_clip", None),
-                    "demand_family": cfg.get("demand_family", "ar1"),
+                    "demand_family": scenario or cfg.get("demand_family", "ar1"),
                     "poisson_mu": cfg.get("poisson_mu", 8.0),
                     "ar1_rho": rho, "ar1_mu": cfg["ar1_mu"],
                     "ar1_sigma": cfg["ar1_sigma"]})
@@ -94,8 +98,14 @@ def main(argv=None):
     ap.add_argument("--intervention", default="honest",
                     choices=("honest", "zeroed", "shuffled", "cross"))
     ap.add_argument("--seed-base", type=int, default=EVAL_SEED_BASE, dest="sb")
+    ap.add_argument("--scenario", default=None,
+                    choices=("black_swan", "extreme_chaos", "poisson", "ar1"),
+                    help="zero-shot OOD evaluation: swap the demand process only. "
+                         "Pair with --rho <label> to keep dumps disjoint "
+                         "(convention: -3 black_swan, -4 extreme_chaos).")
     a = ap.parse_args(argv)
-    costs, recs, cfg, rho = evaluate(a.ckpt, a.episodes, a.rho, a.intervention, a.sb)
+    costs, recs, cfg, rho = evaluate(a.ckpt, a.episodes, a.rho, a.intervention, a.sb,
+                                     scenario=a.scenario)
     out_dir = os.path.join(os.path.dirname(os.path.abspath(a.ckpt)), "eval")
     os.makedirs(out_dir, exist_ok=True)
     suffix = "" if a.intervention == "honest" else f"_{a.intervention}"
@@ -115,7 +125,8 @@ def main(argv=None):
                    "episodes": int(a.episodes), "per_episode": recs}, f)
     m = float(np.mean(list(costs.values())))
     print(f"[eval] {os.path.basename(os.path.dirname(os.path.abspath(a.ckpt)))}  "
-          f"content={cfg['content']} intervention={a.intervention} rho={rho:g}  "
+          f"content={cfg['content']} intervention={a.intervention} rho={rho:g}"
+          f"{'' if not a.scenario else '  OOD-scenario=' + a.scenario}  "
           f"episodes={a.episodes}  mean team cost {m:.1f}")
     print(f"[eval] arch: hidden={cfg['hidden']} bins={cfg['act_bins']} "
           f"s_max={cfg['s_max']:g} msg_dim={cfg['msg_dim']} "

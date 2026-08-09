@@ -45,12 +45,19 @@ for c in nocomm raw arpred dhatc ip learned; do
 # analysis stage would pair DP arms against AR baselines on the shared label.
 for c in nocomm raw arpred; do
   CELLS+=("dr_poisson|-1|$c|retailer_broadcast|1.0|-"); done
-# P2 (garbling): clip in {12, 20}; nocomm AND raw at each level (V is within-clip)
-for cl in 12 20; do for c in nocomm raw; do
+# P2 (garbling): clip levels chosen by the REGISTERED pre-flight audit
+# (scripts/audit_garbling.py): c=6 destroys 62% of linearly-recoverable demand info
+# from the order stream, c=8 destroys 47%. The originally planned c in {12,20} was
+# measured at 11% and -14% -- too weak to test the Blackwell mechanism, so a null
+# there would have been uninformative. Blackwell nesting min(o,6)=min(min(o,8),6)
+# still holds, so the dose ordering Gamma(6) >= Gamma(8) >= 0 is well posed.
+for cl in 6 8; do for c in nocomm raw; do
   CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|$cl"); done; done
-# F_GEOMETRY on raw @ rho .9: positive (upstream_only == F_CONTENT raw, reused) +
-# placebos; no_neighbor is the harness placebo
-for t in downstream_only manufacturer_broadcast no_neighbor; do
+# F_GEOMETRY on raw @ rho .9. retailer_broadcast is the direct-source arm (reused from
+# F_CONTENT). upstream_only is the RELAYED arm -- H-SOURCE contrasts the two. The rest
+# are placebos: downstream_only echoes each agent's own past order back at it, and
+# no_neighbor wires nobody to anybody (bit-identical to nocomm; V must be EXACTLY 0).
+for t in upstream_only downstream_only manufacturer_broadcast no_neighbor; do
   CELLS+=("ar1|0.9|raw|$t|1.0|-"); done
 # H-TIME: staleness gradient (raw itself is lag 0, reused from F_CONTENT)
 for c in raw_lag1 raw_lag2; do
@@ -172,7 +179,37 @@ for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl <<<"$cell"
         $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 --rho "$r" --intervention "$iv" >>"runs/logs/$tag.log" 2>&1
     done; fi
   done; done
-echo "   evaluation complete."
+echo "   in-distribution evaluation complete."
+
+echo "== stage 4b: ZERO-SHOT OOD transfer (nocomm vs raw, ar1 rho=.9 policies) =="
+# Policies trained on ar1 are evaluated, WITHOUT retraining, on the vendored stress
+# decks. Training on those decks would be confounded (fixed calendar, memorisable);
+# transferring to them is not -- the schedule is unanticipated, so the retailer's
+# observation is a genuine early warning. Labels keep dumps disjoint.
+for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl <<<"$cell"
+  [[ "$f" == "ar1" && "$r" == "0.9" && "$cl" == "-" && "$t" == "retailer_broadcast" ]] || continue
+  [[ "$c" == "nocomm" || "$c" == "raw" ]] || continue
+  for sc_pair in "black_swan:-3" "extreme_chaos:-4"; do
+    sc="${sc_pair%%:*}"; lab="${sc_pair##*:}"
+    for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl")
+      [[ -f "runs/$tag/eval/seed10000_rho${lab}.json" ]] || \
+        $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 \
+            --scenario "$sc" --rho "$lab" >>"runs/logs/$tag.log" 2>&1
+      if [[ "$c" != "nocomm" ]]; then for iv in zeroed shuffled; do
+        [[ -f "runs/$tag/eval/seed10000_rho${lab}_${iv}.json" ]] || \
+          $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 \
+              --scenario "$sc" --rho "$lab" --intervention "$iv" >>"runs/logs/$tag.log" 2>&1
+      done; fi
+    done
+  done
+done
+# OOD reference bars: a base-stock policy fitted ON the shock (the "oracle who knew")
+for sc_pair in "black_swan:-3" "extreme_chaos:-4"; do
+  sc="${sc_pair%%:*}"; lab="${sc_pair##*:}"
+  [[ -f "runs/baselines_rho${lab}.json" ]] || \
+    $PY -m signal_lab.baselines --demand-family "$sc" --rho "$lab" || true
+done
+echo "   OOD transfer complete."
 
 echo "== stage 5: analysis per (family,rho,beta) =="
 # analysis groups: (family, rho, beta, clip) -- clip arms pair within their own level
@@ -187,6 +224,18 @@ for key in $(printf '%s\n' "${CELLS[@]}" | awk -F'|' '{print $1"|"$2"|"$5"|"$6}'
   [[ -n "$arms" ]] || continue
   $PY -m signal_lab.stats --nocomm "${noc%,}" --arms "${arms%,}" --rho "$r" \
       | tee "runs/stats_${f}_rho${r}_b${b//./}.txt"
+done
+
+echo "== stage 5b: OOD analysis =="
+for lab in -3 -4; do
+  noc=""; arms=""
+  for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k))
+    noc+="$(tag_of ar1 0.9 nocomm retailer_broadcast 1.0 "$s" -),"
+    arms+="$(tag_of ar1 0.9 raw retailer_broadcast 1.0 "$s" -),"
+  done
+  [[ -f "runs/$(echo "${arms%%,*}")/eval/seed10000_rho${lab}.json" ]] || continue
+  $PY -m signal_lab.stats --nocomm "${noc%,}" --arms "${arms%,}" --rho "$lab" \
+      | tee "runs/stats_OOD_rho${lab}.txt"
 done
 
 echo "== stage 6: hypotheses =="

@@ -85,6 +85,34 @@ def p1_conjunction(delta_dp, delta_ar, alpha=0.05):
             "rule": "IU: both one-sided bootstrap-t lower bounds > 0 at alpha=.05"}
 
 
+def p1_did(delta_dp, delta_ar, alpha=0.05):
+    """P1' (amended): the forecast's ADVANTAGE over raw is larger under regime
+    uncertainty than under persistence.
+
+        Delta(regime)_s = V_arpred(regime)_s - V_raw(regime)_s      [per seed s]
+        H1: mean_s [ Delta(DP)_s - Delta(AR,rho=.9)_s ] > 0
+
+    Replaces the registered intersection-union crossover, whose AR conjunct
+    (V_raw > V_forecast at rho=.9) is refuted by the dev ladder: arpred beat raw by
+    +153 concordantly across three seeds. Blackwell sufficiency holds
+    information-theoretically but not through a LEARNING channel, because the receiver
+    must estimate the map -- so the sign never crosses; the magnitude does.
+
+    IMPORTANT: pass Deltas computed on GAP-RECOVERED units, not raw cost. Cost scales
+    differ by regime (AR gap ~1231, DP gap ~2748), so an absolute-cost DiD would
+    confound 'more value available' with 'forecast helps more'."""
+    d = np.asarray(delta_dp, float) - np.asarray(delta_ar, float)
+    lo = boot_t_lower(d, alpha)
+    t, p = one_sided_t(d)
+    return {"did_mean": float(d.mean()),
+            "did_se": float(d.std(ddof=1) / np.sqrt(len(d))),
+            "lower_boot_t": lo, "t": t, "p_one_sided": p,
+            "delta_dp_mean": float(np.mean(delta_dp)),
+            "delta_ar_mean": float(np.mean(delta_ar)),
+            "reject_null": bool(lo > 0),
+            "rule": "one-sided studentized bootstrap-t lower bound on the DiD > 0"}
+
+
 def h2_slope(v_by_rho, alpha=0.05):
     """v_by_rho: {rho: seed-vector of V}; per-seed OLS slope, one-sided t > 0."""
     rhos = sorted(v_by_rho)
@@ -162,6 +190,11 @@ def self_test():
     h_up, h_flat = h2_slope(up), h2_slope(flat)
     assert h_up["reject_null"] and abs(h_up["slope_mean"] - 1000) < 60, h_up
     assert not h_flat["reject_null"], h_flat
+    # P1': DiD recovers a planted regime difference; a flat pair does not
+    dp = rng.normal(0.55, 0.08, 15); ar = rng.normal(0.12, 0.06, 15)
+    r = p1_did(dp, ar)
+    assert r["reject_null"] and abs(r["did_mean"] - 0.43) < 0.05, r
+    assert not p1_did(ar, ar + rng.normal(0, 0.06, 15))["reject_null"]
     # HREP: identical-mean families equivalent at the margin; far one not
     base = rng.normal(900, 25, 15)
     fams = {"raw": base + rng.normal(0, 10, 15),

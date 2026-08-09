@@ -66,13 +66,23 @@ class BeerGame:
     def __init__(self, config=None):
         self.cfg = {**DEFAULTS, **(config or {})}
         family = self.cfg.get("demand_family", "ar1")
-        if family not in ("ar1", "poisson", "dr_poisson"):
-            raise ValueError(f"demand_family must be 'ar1', 'poisson' or 'dr_poisson', "
-                             f"got {family!r}")
+        # black_swan / extreme_chaos are the VENDORED stress decks. They are fixed
+        # calendars (the clock explains ~75% of demand variance, residual autocorr ~0),
+        # so TRAINING on them is confounded: an agent with memory learns the schedule
+        # and no message can add anything. They are exposed here for ZERO-SHOT OOD
+        # EVALUATION of policies trained on ar1/poisson, where the schedule is genuinely
+        # unanticipated and the retailer's observation IS an early warning.
+        if family not in ("ar1", "poisson", "dr_poisson",
+                          "black_swan", "extreme_chaos"):
+            raise ValueError(f"demand_family must be one of ar1 | poisson | dr_poisson "
+                             f"| black_swan | extreme_chaos, got {family!r}")
 
         env_cfg = {k: v for k, v in self.cfg.items() if k not in _ADAPTER_ONLY_KEYS}
         env_cfg["demand_type"] = "poisson"      # all families ride on this; see docstring
-        if family == "dr_poisson":
+        if family in ("black_swan", "extreme_chaos"):
+            env_cfg["demand_type"] = family     # the vendored deck, unmodified
+            self._env = BeerGameParallelEnv(env_cfg)
+        elif family == "dr_poisson":
             # P1's regime-uncertainty side: the VENDORED FamilyRandomizedBeerGame draws
             # a fresh lambda ~ U[dr_lambda_lo, dr_lambda_hi] at every reset. Restricted
             # to the poisson family so the treatment is exactly "unknown rate".
