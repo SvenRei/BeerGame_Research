@@ -13,7 +13,9 @@ Full rationale and registered decisions R1–R6: [`docs/DESIGN.md`](docs/DESIGN.
 ## Layout
 
 ```
-env/beer_game.py        physics + AR(1) demand + global state  (ported, unchanged)
+vendor/                 THE ENVIRONMENT, vendored UNMODIFIED from BeerGame_Comm:
+                          envs/beer_game_env.py, scripts/demand_families.py, conf/config.yaml
+env/beer_game.py        ADAPTER ONLY -- no physics; numpy interface over vendor/
 signal_lab/messages.py  MessageProvider: content ladder, topology routing, do(m) wrappers
 signal_lab/agent.py     shared actor (GRU, role one-hot, S-grid head, msg head) + critic
 signal_lab/train.py     rollout, PPO update, gates, checkpoints, CSVs
@@ -35,7 +37,9 @@ The package is `signal_lab`, not `signal` — `signal` collides with the Python 
 python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-python tests/test_all.py                            # all invariants must be green first
+python tests/test_vendor_env.py                     # the env's own 89-test suite, verbatim
+python tests/test_adapter.py                        # adapter faithfully exposes the env
+python tests/test_all.py                            # project invariants
 python -m signal_lab.baselines --rho 0.9            # fit the bars (report refuses without)
 python -m signal_lab.train --set content=nocomm seed=60
 python -m signal_lab.evaluate --ckpt runs/nocomm_s60/ckpt_best.pt --episodes 50
@@ -53,7 +57,12 @@ signaling (Pearson/Spearman vs d_prev). Paired vs the nocomm arm on identical CR
 V per episode, Cohen's d_z, P(V>0), paired t, Wilcoxon, BCa bootstrap CI, Schuirmann
 TOST (`--tost-margin`), and Holm correction across the arm family. With a zeroed do(m)
 dump present, the causal listening contrast (cost delta + action divergence) is added.
-Fail-closed on missing dumps, seed mismatches, or NaNs.
+Paired against the baselines on the same eval draws: V vs StaticBS and vs CondBS with
+paired t, Wilcoxon, BCa CI and TOST, plus gap-recovered with a BCa interval (requires
+`baselines.py` schema 2 -- re-run it once). Across training-seed replicates (tags
+`<arm>_s<NN>`): seed-level mean V with a BETWEEN-SEED se, one-sample t, BCa CI and sign
+concordance -- because the eval seed space is shared, pooling episodes across replicates
+would understate uncertainty. Fail-closed on missing dumps, seed mismatches, or NaNs.
 
 Evaluate one training run completely:
 

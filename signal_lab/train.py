@@ -9,7 +9,8 @@ Recipe (reference-adopted, registered decisions R2-R4):
   entropy     ent_start -> ent_end linearly over `anneal_episodes` (ABSOLUTE; never
               derived from the budget -- the D1/c7 coupling is banned by construction)
   stopping    none: fixed budget; `budget_milestones` snapshots double as V(budget)
-  selection   best gate checkpoint; gate rho in {0.15,0.45,0.75} (never the deployment
+  selection   R7: trailing-mean monitor (held-out rho=0.9, seeds 60000+); the low-rho
+              gate remains logged as a diagnostic. gate rho in {0.15,0.45,0.75} (not the deployment
               0.9); a monitor-only rho=0.9 trace is logged and never selects
 
 Diagnostics: honest explained variance EV = 1 - Var(G - V)/Var(G) at every update,
@@ -59,6 +60,10 @@ def load_config(path, overrides):
             cfg[k] = v.lower() in ("1", "true", "yes")
         elif isinstance(cur, list):
             cfg[k] = [int(x) for x in v.strip("[]() ").split(",") if x.strip() != ""]
+        elif cur is None:
+            # a null default (e.g. obs_order_clip) carries no type to cast to;
+            # interpret the literal via yaml so 12 -> int, 0.5 -> float, null -> None.
+            cfg[k] = yaml.safe_load(v)
         else:
             cfg[k] = type(cur)(v)
     return cfg
@@ -68,12 +73,21 @@ def make_env(cfg, rho=None):
     return BeerGame({"demand_family": cfg.get("demand_family", "ar1"),
                      "ar1_rho": float(cfg["rho"] if rho is None else rho),
                      "ar1_mu": cfg["ar1_mu"], "ar1_sigma": cfg["ar1_sigma"],
-                     "poisson_mu": cfg.get("poisson_mu", 8.0)})
+                     "poisson_mu": cfg.get("poisson_mu", 8.0),
+                     # P1 / P2 treatment keys -- these MUST reach the env; a previous
+                     # whitelist silently dropped them, which would have trained
+                     # "garbled" arms on ungarbled observations.
+                     "dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
+                     "dr_lambda_hi": cfg.get("dr_lambda_hi", 24.0),
+                     "obs_order_clip": cfg.get("obs_order_clip", None)})
 
 
 def make_provider(cfg, device="cpu"):
     return MessageProvider(cfg["content"], cfg["topology"], cfg["msg_dim"],
-                           cfg={"ar1_mu": cfg["ar1_mu"], "ar1_rho": cfg["rho"]},
+                           cfg={"ar1_mu": cfg["ar1_mu"], "ar1_rho": cfg["rho"],
+                                    "demand_family": cfg.get("demand_family", "ar1"),
+                                    "dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
+                                    "dr_lambda_hi": cfg.get("dr_lambda_hi", 24.0)},
                            forecaster_path=cfg.get("forecaster_path") or None,
                            device=device)
 
@@ -244,7 +258,8 @@ def main(argv=None):
     print(f"[signal] tag={tag} config_sha={hashlib.sha256(resolved.encode()).hexdigest()[:12]}")
 
     torch.manual_seed(cfg["seed"]); np.random.seed(cfg["seed"])
-    actor = SharedActor(cfg["msg_dim"], cfg["hidden"], cfg["act_bins"], cfg["s_max"])
+    actor = SharedActor(cfg["msg_dim"], cfg["hidden"], cfg["act_bins"], cfg["s_max"],
+                        msg_scale=cfg.get("msg_scale", 100.0))
     critic = Critic(cfg["hidden"])
     provider = make_provider(cfg)
     opt_a = torch.optim.Adam(actor.parameters(), lr=float(cfg["lr_actor"]))
@@ -272,6 +287,7 @@ def main(argv=None):
             _, _, done, _ = e.step(np.random.randint(0, cfg["max_order"] + 1, 4))
 
     best, best_ep = float("inf"), -1
+    crit_hist = []
     best_payload = None
     milestones = sorted(int(m) for m in cfg["budget_milestones"])
     batch, last_stats = [], {}
@@ -306,9 +322,19 @@ def main(argv=None):
             mon = gate_eval(actor, provider, cfg, (MONITOR_RHO,), MONITOR_SEED_BASE,
                             int(cfg["gate_episodes_per_rho"]))
             mark = ""
-            if g < best - 1e-9:
-                best, best_ep, mark = g, ep, "  <-- new best (checkpoint saved)"
-                best_payload = clone_payload(actor, critic, cfg, ep, g)
+            # R7: selection criterion is configurable. `monitor` selects on held-out
+            # rho=0.9 seeds (MONITOR_SEED_BASE, disjoint from the eval space) because
+            # on D-A2 the monitor reproduced the eval ranking exactly (Spearman 1.0)
+            # while the low-rho gate scored 0.2 and ranked the run's WORST checkpoint
+            # second-best. `select_smooth` averages the last N criterion readings so a
+            # single lucky draw cannot win; N=1 restores single-draw behaviour.
+            crit_raw = mon if cfg.get("select_on", "monitor") == "monitor" else g
+            crit_hist.append(crit_raw)
+            crit = float(np.mean(crit_hist[-max(1, int(cfg.get("select_smooth", 3))):]))
+            if crit < best - 1e-9:   # mean over min(N, available) -- never leaves a run
+                                     # with no ckpt_best (fail-closed on short runs)
+                best, best_ep, mark = crit, ep, "  <-- new best (checkpoint saved)"
+                best_payload = clone_payload(actor, critic, cfg, ep, crit)
                 torch.save(best_payload, os.path.join(run, "ckpt_best.pt"))
             wga.writerow({"episode": ep, "gate_cost": f"{g:.1f}", "best": f"{best:.1f}",
                           "best_ep": best_ep, "monitor_rho09": f"{mon:.1f}",
@@ -331,7 +357,14 @@ def main(argv=None):
                os.path.join(run, "ckpt_final.pt"))
     for f in (ftr, fga, fup):
         f.close()
-    print(f"[signal] best gate {best:.1f} @ ep {best_ep}")
+    if best_ep < 0:      # no gate ever fired (short run / gate_every > budget):
+        # fail-safe, loudly -- a run must NEVER end without a ckpt_best, or every
+        # downstream consumer (eval, sweep idempotency) breaks on a missing file.
+        torch.save(clone_payload(actor, critic, cfg, ep, float("nan")),
+                   os.path.join(run, "ckpt_best.pt"))
+        print("[signal] WARNING: no selection gate fired; ckpt_best = final policy")
+    print(f"[signal] best {cfg.get('select_on','monitor')} criterion "
+          f"(trailing mean of {cfg.get('select_smooth',3)}) {best:.1f} @ ep {best_ep}")
     print("[signal] done.", flush=True)                      # terminal marker (invariant)
 
 

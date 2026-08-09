@@ -217,7 +217,166 @@ def t_stats():
     _, adj, _, _ = multipletests([0.001, 0.02, 0.4], method="holm")
     assert all(a >= r for a, r in zip(adj, [0.001, 0.02, 0.4])) and \
         list(adj) == sorted(adj), "Holm sanity failed"
+    # paired-vs-baseline: planted arm 300 cheaper than a baseline on shared draws
+    from signal_lab.stats import baseline_block, seed_aggregate
+    rng2 = np.random.default_rng(5)
+    draws = rng2.normal(4000, 400, 40)
+    bars = {"schema": 2, "eval_seeds": list(range(10000, 10040)),
+            "static_bs_per_episode": (draws + 300).tolist(),
+            "cond_bs_per_episode": (draws - 700).tolist(),
+            "static_bs": float(draws.mean() + 300), "cond_bs": float(draws.mean() - 700),
+            "eval_episodes": 40}
+    dump = {"per_episode": [{"seed": 10000 + i, "team_cost": float(c)}
+                            for i, c in enumerate(draws)]}
+    bb = baseline_block(dump, bars, tost_margin=100)
+    assert bb["available"] and bb["n_pairs"] == 40
+    assert abs(bb["vs_static"]["V_mean"] - 300) < 1e-6, bb["vs_static"]["V_mean"]
+    assert bb["vs_static"]["t_p"] < 1e-12, "paired test must be decisive on shared draws"
+    # gap is 1000 wide; arm sits 300 below static -> 0.3 recovered
+    assert abs(bb["gap_recovered"]["mean"] - 0.3) < 1e-6, bb["gap_recovered"]
+    # seed mismatch must FAIL-CLOSED, not silently mis-pair
+    bad = {"per_episode": [{"seed": 99000 + i, "team_cost": float(c)}
+                           for i, c in enumerate(draws)]}
+    try:
+        baseline_block(bad, bars, 100); raise AssertionError("seed mismatch not caught")
+    except SystemExit:
+        pass
+    # seed aggregation: between-seed SE, sign concordance
+    ag = seed_aggregate([{"V_mean": 100.0}, {"V_mean": 140.0}, {"V_mean": 120.0}])
+    assert ag["n_seeds"] == 3 and abs(ag["V_seed_mean"] - 120.0) < 1e-9
+    assert ag["sign_concordant"] is True
+    assert abs(ag["V_between_seed_se"] - (np.std([100, 140, 120], ddof=1) / np.sqrt(3))) < 1e-9
+    assert seed_aggregate([{"V_mean": 5.0}, {"V_mean": -5.0}])["sign_concordant"] is False
     print("T-STATS   scipy/statsmodels inference, planted V     OK")
+
+
+def t_dp():
+    """dr_poisson: deterministic, per-episode lambda regime, DP arpred = running mean."""
+    from env.beer_game import BeerGame
+    from signal_lab.messages import MessageProvider
+    means = []
+    for sd in range(25):
+        e = BeerGame({"demand_family": "dr_poisson"}); e.reset(seed=2000 + sd)
+        d = [e.step(np.full(4, 12))[3]["demand"] for _ in range(50)]
+        means.append(np.mean(d))
+    assert min(means) < 8 and max(means) > 18, means      # regimes genuinely vary
+    assert 11 < np.mean(means) < 17, np.mean(means)       # centred near (4+24)/2
+    e1 = BeerGame({"demand_family": "dr_poisson"}); e1.reset(seed=2003)
+    e2 = BeerGame({"demand_family": "dr_poisson"}); e2.reset(seed=2003)
+    for _ in range(30):
+        assert e1.step(np.full(4, 9))[3]["demand"] == e2.step(np.full(4, 9))[3]["demand"]
+    # arpred under dp == running mean of the sender's own incoming, closed form
+    e = BeerGame({"demand_family": "dr_poisson"}); o = e.reset(seed=2010)
+    p = MessageProvider("arpred", "retailer_broadcast", 3,
+                        cfg={"demand_family": "dr_poisson",
+                             "dr_lambda_lo": 4.0, "dr_lambda_hi": 24.0})
+    hist = []
+    rng = np.random.default_rng(0)
+    for t in range(30):
+        inc = p.incoming(e, o, learned_msgs=None)
+        expect = float(np.mean(hist)) if hist else 14.0
+        assert abs(inc[1, 0] - expect) < 1e-6, (t, inc[1, 0], expect)
+        o, _, done, info = e.step(rng.integers(0, 30, 4))
+        hist.append(e.last_incoming["retailer"])
+        if done: break
+    # dhatc must FAIL-CLOSED under dp
+    try:
+        MessageProvider("dhatc", "retailer_broadcast", 3,
+                        cfg={"demand_family": "dr_poisson"},
+                        forecaster_path="assets/forecaster_ar1r9.pt")
+        raise AssertionError("dhatc under dr_poisson must fail-closed")
+    except ValueError:
+        pass
+    print("T-DP      dr_poisson regime + DP forecast + fail-closed OK")
+
+
+def t_p2():
+    """Garbling: physics byte-identical across clip levels; only non-retailer
+    observations change; Blackwell nesting min(o,12)=min(min(o,20),12)."""
+    from env.beer_game import BeerGame
+    rng = np.random.default_rng(4)
+    orders = [rng.integers(0, 60, 4) for _ in range(50)]
+    def roll(clip):
+        e = BeerGame({"obs_order_clip": clip} if clip else {})
+        o = e.reset(seed=77); OBS, C = [o.copy()], []
+        for a in orders:
+            o, c, done, _ = e.step(a); OBS.append(o.copy()); C.append(c.copy())
+            if done: break
+        return np.array(OBS), np.array(C)
+    O_n, C_n = roll(None); O_12, C_12 = roll(12); O_20, C_20 = roll(20)
+    np.testing.assert_array_equal(C_n, C_12)              # costs untouched
+    np.testing.assert_array_equal(C_n, C_20)
+    np.testing.assert_array_equal(O_n[:, 0, :], O_12[:, 0, :])   # retailer unclipped
+    np.testing.assert_array_equal(O_12[:, 1:, 3],
+                                  np.minimum(O_n[:, 1:, 3], 12))  # clip applied
+    np.testing.assert_array_equal(O_12[:, 1:, 3],
+                                  np.minimum(O_20[:, 1:, 3], 12))  # Blackwell chain
+    assert (O_n[:, 1:, 3] > 12).any(), "orders never exceeded 12; clip untested"
+    # the treatment must survive the TRAINING config path too (a whitelist once ate it)
+    from signal_lab.train import load_config, make_env
+    cfg = load_config(os.path.join(ROOT, "conf", "signal.yaml"), ["obs_order_clip=12"])
+    assert make_env(cfg)._env._config.get("obs_order_clip") == 12, \
+        "obs_order_clip dropped on the training env path"
+    cfg = load_config(os.path.join(ROOT, "conf", "signal.yaml"),
+                      ["demand_family=dr_poisson", "dr_lambda_lo=6", "dr_lambda_hi=20"])
+    ec = make_env(cfg)._env._config
+    assert (ec.get("dr_lambda_lo"), ec.get("dr_lambda_hi")) == (6.0, 20.0), \
+        "dr bounds dropped on the training env path"
+    print("T-P2      garbling: costs invariant, obs clipped, Blackwell nested OK")
+
+
+def t_geo():
+    """Topology routing rows exact; no_neighbor delivers all-zero incoming."""
+    from env.beer_game import BeerGame
+    from signal_lab.messages import MessageProvider, routing_matrix
+    R = routing_matrix("upstream_only")
+    np.testing.assert_array_equal(R, routing_matrix("neighbor"))
+    D = routing_matrix("downstream_only")
+    assert D[0, 1] == D[1, 2] == D[2, 3] == 1 and D.sum() == 3
+    M = routing_matrix("manufacturer_broadcast")
+    assert M[0, 3] == M[1, 3] == M[2, 3] == 1 and M.sum() == 3
+    assert routing_matrix("no_neighbor").sum() == 0
+    e = BeerGame(); o = e.reset(seed=9)
+    p = MessageProvider("raw", "no_neighbor", 3, cfg={"ar1_mu": 12.0, "ar1_rho": 0.9})
+    rng = np.random.default_rng(1)
+    for _ in range(20):
+        assert np.all(p.incoming(e, o, learned_msgs=None) == 0.0)
+        o, _, d, _ = e.step(rng.integers(0, 30, 4))
+        if d: break
+    # manufacturer_broadcast: receivers get the MANUFACTURER's value
+    e = BeerGame(); o = e.reset(seed=9)
+    p = MessageProvider("raw", "manufacturer_broadcast", 3,
+                        cfg={"ar1_mu": 12.0, "ar1_rho": 0.9})
+    p.incoming(e, o, learned_msgs=None)
+    o, _, _, _ = e.step(np.array([7, 9, 11, 13]))
+    inc = p.incoming(e, o, learned_msgs=None)
+    assert inc[0, 0] == inc[1, 0] == inc[2, 0] == e.last_incoming["manufacturer"]
+    assert inc[3, 0] == 0.0
+    print("T-GEO     four new topologies routed exactly, placebo is silent OK")
+
+
+def t_lag():
+    """raw_lag_k delivers the sender's incoming from k periods before raw's."""
+    from env.beer_game import BeerGame
+    from signal_lab.messages import MessageProvider
+    e = BeerGame(); o = e.reset(seed=13)
+    p0 = MessageProvider("raw", "retailer_broadcast", 3, cfg={"ar1_mu": 12.0})
+    p1 = MessageProvider("raw_lag1", "retailer_broadcast", 3, cfg={"ar1_mu": 12.0})
+    p2 = MessageProvider("raw_lag2", "retailer_broadcast", 3, cfg={"ar1_mu": 12.0})
+    seq0, seq1, seq2 = [], [], []
+    rng = np.random.default_rng(2)
+    for _ in range(30):
+        seq0.append(p0.incoming(e, o, None)[1, 0])
+        seq1.append(p1.incoming(e, o, None)[1, 0])
+        seq2.append(p2.incoming(e, o, None)[1, 0])
+        o, _, d, _ = e.step(rng.integers(0, 30, 4))
+        if d: break
+    assert seq1[0] == 12.0 and seq1[1] == 12.0 and seq1[2:] == seq0[1:-1], "lag1"
+    assert seq2[:3] == [12.0] * 3 and seq2[3:] == seq0[1:-2], "lag2"
+    # episode boundary: a fresh episode must re-prime with mu, not leak history
+    o = e.reset(seed=14)
+    assert p1.incoming(e, o, None)[1, 0] == 12.0, "lag buffer leaked across episodes"
+    print("T-LAG     lag contents exact, episode reset clean OK")
 
 
 def t_smoke():
@@ -278,6 +437,6 @@ def t_sweep():
 
 if __name__ == "__main__":
     t_env(); t_arpred(); t_interv(); t_frozen(); t_param(); t_sym(); t_grad()
-    t_stats(); t_smoke(); t_sweep()
+    t_stats(); t_dp(); t_p2(); t_geo(); t_lag(); t_smoke(); t_sweep()
     print("\nALL TESTS PASS -- the arm-symmetry, gradient-isolation, and fail-closed "
           "contracts hold.")

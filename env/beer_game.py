@@ -1,162 +1,155 @@
-"""env/beer_game.py -- the 4-echelon Beer Game, self-contained (numpy only).
+"""env/beer_game.py -- ADAPTER ONLY. Zero physics live in this file.
 
-Faithful port of the physics of the validated BeerGame_Comm environment:
-  * agents: retailer -> wholesaler -> distributor -> manufacturer
-  * step phases, in fixed order:
-      PHASE 1  RECEIVE  goods scheduled to arrive now land in inventory
-      PHASE 2  FULFILL  each stage sees incoming demand (retailer: customer AR(1);
-                        others: orders arriving up the order pipeline), ships what it
-                        can (remainder -> backlog) DOWN the chain; the manufacturer
-                        turns received orders into production (-> own shipment pipe)
-      PHASE 3  ORDER    integer order in [0, max_order] travels UP after the order lead
-      PHASE 4  COST     h * inventory + b * backlog at every stage
-  * lead times (defaults reproduce the original constants): order 2 (manufacturer 1),
-    shipping 2, production 2
-  * demand: AR(1) latent d*_t = mu + rho (d*_{t-1} - mu) + N(0, sigma); emitted
-    demand = max(0, round(latent)); the latent stays unclipped so autocorrelation is
-    preserved (identical to the validated ar1_step).
+The environment is the user's validated implementation, vendored UNMODIFIED at:
+    vendor/envs/beer_game_env.py        (BeerGameParallelEnv)
+    vendor/scripts/demand_families.py   (AR(1) / NegBin family subclasses)
+    vendor/conf/config.yaml             (reference config, for provenance)
 
-Deliberate simplifications vs the source (API only, physics unchanged):
-  * actions are integer order quantities [N] directly (no [0,1] float indirection)
-  * no PettingZoo wrapper; reset/step return plain numpy arrays
-  * global-state pipeline horizon K=6 slots (max configured lead is 2; the original
-    exposed 15 mostly-empty slots)
+This module translates that PettingZoo ParallelEnv into the small numpy interface
+signal_lab consumes. Every state variable, cost, lead time, pipeline and demand draw is
+produced by the vendored code. If this adapter and the vendored env ever disagree, the
+vendored env is correct by definition.
 
-CRN contract: all randomness flows through one np.random.Generator seeded in reset();
-identical seeds => bit-identical trajectories for identical action sequences.
+Translation performed here (interface only, never physics):
+  * actions: signal_lab emits INTEGER order quantities [N]; the vendored env expects a
+    dict of float actions in [0,1] scaled by max_order. We divide by max_order; the
+    env's own round-half-up recovers the integer exactly (asserted in tests/test_env.py).
+  * returns: the PettingZoo 5-tuple becomes (obs [N,4], local_costs [N], done, info).
+    Costs are read from the env's own infos[agent]["local_cost"] -- never recomputed.
+  * demand: info["demand"] is the retailer's realized incoming order for the period,
+    read from the env's current_incoming_order.
+  * AR(1) is selected the way the vendored code requires -- demand_type="poisson" plus
+    family="ar1" via make_demand_family_envs -- NOT demand_type="ar1", which the
+    vendored env rejects by design.
+
+The vendored env primes its pipelines at reset (4 units in each of two shipment slots
+and two order slots; manufacturer one order slot) giving initial on-order 16/16/16/12.
+That is the env's own behaviour, inherited here rather than reimplemented.
 """
+import os
+import sys
+
 import numpy as np
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from vendor.envs.beer_game_env import MAX_DELAY, BeerGameParallelEnv  # noqa: E402
+from vendor.scripts.demand_families import ar1_step  # noqa: E402,F401  (re-exported)
+from vendor.scripts.demand_families import make_demand_family_envs  # noqa: E402
 
 AGENTS = ["retailer", "wholesaler", "distributor", "manufacturer"]
 N_AGENTS = 4
-OBS_DIM = 4                      # [inventory, backlog, on_order, last_incoming_order]
-PIPE_SLOTS = 6                   # pipeline horizon in the global state
-STATE_DIM = 1 + N_AGENTS * (3 + PIPE_SLOTS)
+OBS_DIM = 4                       # [inventory, backlog, on_order, last_incoming]
+PIPE_SLOTS = MAX_DELAY            # the vendored get_global_state walks MAX_DELAY slots
+STATE_DIM = 1 + N_AGENTS * (3 + 2 * MAX_DELAY)   # matches get_global_state exactly
 
+_AR1Env, _NegBinEnv, _FamilyEnv = make_demand_family_envs(BeerGameParallelEnv)
+
+# Adapter defaults. Keys are passed through to the vendored env, so its own defaults
+# and validation apply to anything omitted here.
 DEFAULTS = dict(
     horizon=50, max_order=100, holding_cost=0.5, backorder_cost=1.0,
-    order_lead=2, order_lead_mfr=1, ship_lead=2, production_lead=2,
-    init_inventory=12, demand_family="ar1", ar1_mu=12.0, ar1_rho=0.9, ar1_sigma=3.0,
-    poisson_mu=8.0,
+    demand_family="ar1", ar1_mu=12.0, ar1_rho=0.9, ar1_sigma=3.0,
+    dr_lambda_lo=4.0, dr_lambda_hi=24.0,   # dr_poisson: per-episode lambda ~ U[lo,hi]
+    poisson_mu=8.0, jittery_lead_time=False,
 )
 
-
-def ar1_step(prev_latent, mu, rho, sigma, rng):
-    """One AR(1) step -> (demand_int, new_latent). Port of the validated sampler."""
-    latent = mu + rho * (prev_latent - mu) + rng.normal(0.0, sigma)
-    return max(0.0, float(round(latent))), latent
-
-
-class _Pipeline:
-    """Arrival-time-keyed queue: add(step_now, qty, lead) -> arrives at step_now+lead."""
-
-    def __init__(self):
-        self.q = {}
-
-    def add(self, step_now, qty, lead):
-        if qty > 0:
-            k = step_now + int(lead)
-            self.q[k] = self.q.get(k, 0.0) + float(qty)
-
-    def receive(self, step_now):
-        return float(self.q.pop(step_now, 0.0))
-
-    def peek(self, step_now, slots):
-        return [float(self.q.get(step_now + t, 0.0)) for t in range(1, slots + 1)]
+_ADAPTER_ONLY_KEYS = ("demand_family", "ar1_rho", "ar1_mu", "ar1_sigma",
+                      "poisson_mu", "rho")
 
 
 class BeerGame:
+    """Numpy-facing adapter over the vendored BeerGameParallelEnv."""
+
     def __init__(self, config=None):
         self.cfg = {**DEFAULTS, **(config or {})}
+        family = self.cfg.get("demand_family", "ar1")
+        if family not in ("ar1", "poisson", "dr_poisson"):
+            raise ValueError(f"demand_family must be 'ar1', 'poisson' or 'dr_poisson', "
+                             f"got {family!r}")
+
+        env_cfg = {k: v for k, v in self.cfg.items() if k not in _ADAPTER_ONLY_KEYS}
+        env_cfg["demand_type"] = "poisson"      # all families ride on this; see docstring
+        if family == "dr_poisson":
+            # P1's regime-uncertainty side: the VENDORED FamilyRandomizedBeerGame draws
+            # a fresh lambda ~ U[dr_lambda_lo, dr_lambda_hi] at every reset. Restricted
+            # to the poisson family so the treatment is exactly "unknown rate".
+            env_cfg.update(dr_families=["poisson"],
+                           dr_lambda_lo=float(self.cfg["dr_lambda_lo"]),
+                           dr_lambda_hi=float(self.cfg["dr_lambda_hi"]))
+            self._env = _FamilyEnv(env_cfg)
+        elif family == "ar1":
+            env_cfg.update(family="ar1",
+                           ar1_mu=float(self.cfg["ar1_mu"]),
+                           ar1_rho=float(self.cfg["ar1_rho"]),
+                           ar1_sigma=float(self.cfg["ar1_sigma"]))
+            self._env = _AR1Env(env_cfg)
+        else:
+            self._env = BeerGameParallelEnv(env_cfg)
+            mu = float(self.cfg["poisson_mu"])
+            if mu != 8.0:
+                # The vendored base env hardcodes poisson(8). Honour poisson_mu by
+                # overriding ONLY the demand draw; all physics stay untouched.
+                env_ref = self._env
+
+                def _roll(step, _e=env_ref, _mu=mu):
+                    return float(_e.np_random.poisson(_mu))
+                self._env._roll_stochastic_demand = _roll
+
         self.h = float(self.cfg["holding_cost"])
         self.b = float(self.cfg["backorder_cost"])
         self.horizon = int(self.cfg["horizon"])
         self.max_order = int(self.cfg["max_order"])
+        self.last_demand = 0.0
+
+    # ------------------------------------------------------------------ views
+    @property
+    def inventory(self):
+        return self._env.inventory
+
+    @property
+    def backlog(self):
+        return self._env.backlog
+
+    @property
+    def on_order(self):
+        return self._env.unfulfilled_orders
+
+    @property
+    def last_incoming(self):
+        return self._env.current_incoming_order
+
+    @property
+    def t(self):
+        """Steps completed so far (0 after reset)."""
+        return int(self._env.current_step)
+
+    def _obs(self):
+        return np.stack([self._env._build_obs(a) for a in AGENTS]).astype(np.float32)
+
+    def global_state(self):
+        return self._env.get_global_state()
 
     # ------------------------------------------------------------------ lifecycle
     def reset(self, seed=None):
-        self.rng = np.random.default_rng(seed)
-        self.t = 0
-        init = float(self.cfg["init_inventory"])
-        self.inventory = {a: init for a in AGENTS}
-        self.backlog = {a: 0.0 for a in AGENTS}
-        self.on_order = {a: 0.0 for a in AGENTS}          # unfulfilled upstream orders
-        self.last_incoming = {a: 0.0 for a in AGENTS}     # demand each stage saw last step
-        self.ship_pipe = {a: _Pipeline() for a in AGENTS}
-        self.order_pipe = {a: _Pipeline() for a in AGENTS}
-        self._latent = float(self.cfg["ar1_mu"])          # AR(1) latent, init at mu
-        self.last_demand = 0.0                            # last realized customer demand
+        self._env.reset(seed=seed)
+        self.last_demand = 0.0
         return self._obs()
 
-    def _customer_demand(self):
-        if self.cfg["demand_family"] == "ar1":
-            d, self._latent = ar1_step(self._latent, float(self.cfg["ar1_mu"]),
-                                       float(self.cfg["ar1_rho"]),
-                                       float(self.cfg["ar1_sigma"]), self.rng)
-            return d
-        return float(self.rng.poisson(float(self.cfg["poisson_mu"])))
-
-    # ------------------------------------------------------------------ dynamics
     def step(self, orders):
         """orders: array-like [N] of integer order quantities in [0, max_order].
         Returns (obs [N,4], local_costs [N], done, info)."""
-        orders = np.clip(np.asarray(orders, dtype=float).round(), 0, self.max_order)
-
-        # PHASE 1 -- receive shipments
-        for a in AGENTS:
-            got = self.ship_pipe[a].receive(self.t)
-            self.inventory[a] += got
-            self.on_order[a] -= got
-
-        # PHASE 2 -- demand arrives, fulfill, ship downstream / produce
-        for i, a in enumerate(AGENTS):
-            if a == "retailer":
-                demand = self._customer_demand()
-                self.last_demand = demand
-            else:
-                demand = self.order_pipe[AGENTS[i - 1]].receive(self.t)
-            if a == "manufacturer":
-                # production: the manufacturer's OWN orders, arriving up its order
-                # pipe (lead 1), become production into its own shipment pipe
-                # (production lead 2) -- total replenishment lead 3.
-                requests = self.order_pipe[a].receive(self.t)
-                if requests > 0:
-                    self.ship_pipe[a].add(self.t, requests, self.cfg["production_lead"])
-            self.last_incoming[a] = demand
-            total_req = demand + self.backlog[a]
-            fulfilled = min(self.inventory[a], total_req)
-            self.inventory[a] -= fulfilled
-            self.backlog[a] = total_req - fulfilled
-            if a != "retailer" and fulfilled > 0:   # ship down to the stage below
-                self.ship_pipe[AGENTS[i - 1]].add(self.t, fulfilled, self.cfg["ship_lead"])
-
-        # PHASE 3 -- place orders upstream
-        for i, a in enumerate(AGENTS):
-            o = float(orders[i])
-            if o > 0:
-                self.on_order[a] += o
-                lead = self.cfg["order_lead_mfr"] if a == "manufacturer" else self.cfg["order_lead"]
-                self.order_pipe[a].add(self.t, o, lead)
-
-        # PHASE 4 -- costs
-        costs = np.array([self.h * self.inventory[a] + self.b * self.backlog[a]
-                          for a in AGENTS], dtype=np.float32)
-
-        self.t += 1
-        done = self.t >= self.horizon
+        o = np.clip(np.asarray(orders, dtype=float), 0, self.max_order)
+        actions = {a: np.array([float(o[i]) / self.max_order], dtype=np.float32)
+                   for i, a in enumerate(AGENTS)}
+        _obs, _rew, _term, truncs, infos = self._env.step(actions)
+        costs = np.array([float(infos[a]["local_cost"]) for a in AGENTS],
+                         dtype=np.float32)
+        self.last_demand = float(self._env.current_incoming_order["retailer"])
+        done = bool(any(truncs.values()))
         return self._obs(), costs, done, {"demand": self.last_demand, "t": self.t}
-
-    # ------------------------------------------------------------------ views
-    def _obs(self):
-        return np.array([[self.inventory[a], self.backlog[a], self.on_order[a],
-                          self.last_incoming[a]] for a in AGENTS], dtype=np.float32)
-
-    def global_state(self):
-        s = [float(self.t)]
-        for a in AGENTS:
-            s.extend([self.inventory[a], self.backlog[a], self.on_order[a]])
-            s.extend(self.ship_pipe[a].peek(self.t, PIPE_SLOTS))
-        return np.array(s, dtype=np.float32)
 
     @staticmethod
     def inventory_position(obs_row):

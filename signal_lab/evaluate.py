@@ -27,14 +27,25 @@ EVAL_SEED_BASE = 10_000        # disjoint from train / gate / monitor spaces
 def load_checkpoint(path):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     cfg = payload["config"]
-    actor = SharedActor(cfg["msg_dim"], cfg["hidden"], cfg["act_bins"], cfg["s_max"])
+    # msg_scale defaults to 100.0 for checkpoints trained BEFORE the key existed --
+    # that is the value they actually used, so the default is correct, not a guess.
+    # The R9 incident was NOT caused by this default: it was caused by an evaluate.py
+    # that omitted the parameter entirely, so a checkpoint trained at 6 was rebuilt at
+    # 100 and the message was attenuated to 6%. The defence is visibility, not
+    # strictness -- every architecture value actually used is echoed in the output
+    # line below, so a train/eval mismatch is legible in the first line of output.
+    actor = SharedActor(cfg["msg_dim"], cfg["hidden"], cfg["act_bins"], cfg["s_max"],
+                        msg_scale=cfg.get("msg_scale", 100.0))
     actor.load_state_dict(payload["actor"])
     actor.eval()
     critic = Critic(cfg["hidden"])
     critic.load_state_dict(payload["critic"])
     critic.eval()
     provider = MessageProvider(cfg["content"], cfg["topology"], cfg["msg_dim"],
-                               cfg={"ar1_mu": cfg["ar1_mu"], "ar1_rho": cfg["rho"]},
+                               cfg={"ar1_mu": cfg["ar1_mu"], "ar1_rho": cfg["rho"],
+                                    "demand_family": cfg.get("demand_family", "ar1"),
+                                    "dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
+                                    "dr_lambda_hi": cfg.get("dr_lambda_hi", 24.0)},
                                forecaster_path=cfg.get("forecaster_path") or None)
     return actor, critic, provider, cfg
 
@@ -45,7 +56,10 @@ def evaluate(ckpt_path, episodes=50, rho=None, intervention="honest",
     if intervention != "honest":
         provider = InterventionWrapper(provider, intervention, seed=seed_base)
     rho = float(cfg["rho"] if rho is None else rho)
-    env = BeerGame({"demand_family": cfg.get("demand_family", "ar1"),
+    env = BeerGame({"dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
+                    "dr_lambda_hi": cfg.get("dr_lambda_hi", 24.0),
+                    "obs_order_clip": cfg.get("obs_order_clip", None),
+                    "demand_family": cfg.get("demand_family", "ar1"),
                     "poisson_mu": cfg.get("poisson_mu", 8.0),
                     "ar1_rho": rho, "ar1_mu": cfg["ar1_mu"],
                     "ar1_sigma": cfg["ar1_sigma"]})
@@ -85,10 +99,16 @@ def main(argv=None):
     out_dir = os.path.join(os.path.dirname(os.path.abspath(a.ckpt)), "eval")
     os.makedirs(out_dir, exist_ok=True)
     suffix = "" if a.intervention == "honest" else f"_{a.intervention}"
-    out = os.path.join(out_dir, f"seed{a.sb}_rho{rho:g}{suffix}.json")
+    # ckpt_best is the canonical arm result and keeps the contract filename that
+    # report.py / stats.py read. Any OTHER checkpoint (final, budget milestones) is
+    # namespaced, so scoring it can never silently overwrite the arm's headline number.
+    stem = os.path.splitext(os.path.basename(os.path.abspath(a.ckpt)))[0]
+    tail = "" if stem == "ckpt_best" else f"__{stem}"
+    out = os.path.join(out_dir, f"seed{a.sb}_rho{rho:g}{suffix}{tail}.json")
     with open(out, "w") as f:
         json.dump(costs, f)
-    traj_out = os.path.join(out_dir, f"seed{a.sb}_rho{rho:g}{suffix}_traj.json")
+    traj_out = os.path.join(out_dir,
+                            f"seed{a.sb}_rho{rho:g}{suffix}{tail}_traj.json")
     with open(traj_out, "w") as f:
         json.dump({"schema": 2, "content": cfg["content"], "rho": rho,
                    "intervention": a.intervention, "seed_base": a.sb,
@@ -97,6 +117,9 @@ def main(argv=None):
     print(f"[eval] {os.path.basename(os.path.dirname(os.path.abspath(a.ckpt)))}  "
           f"content={cfg['content']} intervention={a.intervention} rho={rho:g}  "
           f"episodes={a.episodes}  mean team cost {m:.1f}")
+    print(f"[eval] arch: hidden={cfg['hidden']} bins={cfg['act_bins']} "
+          f"s_max={cfg['s_max']:g} msg_dim={cfg['msg_dim']} "
+          f"msg_scale={cfg.get('msg_scale', 100.0):g}  (from the checkpoint's own config)")
     print(f"[eval] wrote {out}")
     return m
 

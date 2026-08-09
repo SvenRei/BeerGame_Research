@@ -22,14 +22,21 @@ ROOT = os.environ.get("SIGNAL_REPORT_ROOT") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))
 
 
-def _eval_costs(tag, rho):
-    hits = sorted(glob.glob(os.path.join(ROOT, "runs", tag, "eval",
-                                         f"seed*_rho{rho:g}.json")))
-    if not hits:
+EVAL_SEED_BASE = 10_000     # the canonical scoring space; must match evaluate.py
+
+
+def _eval_costs(tag, rho, seed_base=EVAL_SEED_BASE):
+    """Read ONLY the canonical eval dump.
+
+    A previous version globbed seed*_rho<R>.json and merged every match. Because each
+    dump keys episodes "0".."n-1", a diagnostic run at another seed base (e.g. the
+    monitor space 60000) silently OVERWROTE the first episodes of the real eval and
+    shifted the reported mean. Diagnostic dumps at other seed bases are ignored here;
+    pass --seed-base to score one of them deliberately."""
+    path = os.path.join(ROOT, "runs", tag, "eval", f"seed{seed_base}_rho{rho:g}.json")
+    if not os.path.exists(path):
         return None
-    vals = {}
-    for h in hits:
-        vals.update(json.load(open(h)))
+    vals = json.load(open(path))
     return np.array([float(v) for _, v in sorted(vals.items(), key=lambda kv: int(kv[0]))])
 
 
@@ -49,6 +56,8 @@ def main(argv=None):
     ap.add_argument("--arms", required=True, help="comma-separated run tags; the tag "
                     "containing 'nocomm' anchors the V column")
     ap.add_argument("--rho", type=float, default=0.9)
+    ap.add_argument("--seed-base", type=int, default=EVAL_SEED_BASE,
+                    dest="sb", help="scoring seed space (default: the canonical 10000)")
     a = ap.parse_args(argv)
     bpath = os.path.join(ROOT, "runs", f"baselines_rho{a.rho:g}.json")
     bars = json.load(open(bpath)) if os.path.exists(bpath) else None
@@ -61,7 +70,7 @@ def main(argv=None):
             rows.append((tag, None, "NO-RUN", "run dir missing"))
             statuses.append("NO-RUN")
             continue
-        costs = _eval_costs(tag, a.rho)
+        costs = _eval_costs(tag, a.rho, a.sb)
         mean = float(costs.mean()) if costs is not None else None
         st, why = verdict(tag, mean, static_bar)
         rows.append((tag, costs, st, why))

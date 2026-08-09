@@ -8,11 +8,17 @@ seed: 60
 # ----- treatment (the ONLY thing that varies across arms) ---------------------
 content: nocomm         # nocomm | raw | ip | arpred | dhatc | learned
 topology: retailer_broadcast   # retailer_broadcast | neighbor
-msg_dim: 3              # fixed channel width M across the WHOLE study
+msg_dim: 3
+msg_scale: 100.0        # R9: actor input divisor for the incoming message (see agent.py)
 forecaster_path: "assets/forecaster_ar1r9.pt"   # required only for content=dhatc
 
 # ----- environment / axes -----------------------------------------------------
-demand_family: ar1      # ar1 | poisson  (poisson: classic Beer Game, ignores rho)
+demand_family: ar1      # ar1 | poisson | dr_poisson (dr: lambda ~ U[lo,hi] per episode)
+dr_lambda_lo: 4.0       # dr_poisson only
+dr_lambda_hi: 24.0      # dr_poisson only
+obs_order_clip: null    # P2 garbling: non-retailers observe min(order, c); null = off.
+#                         Passed through to the VENDORED env's own obs clip -- physics
+#                         (transitions, costs) are untouched; only the observation map.
 rho: 0.9                # V(rho) axis (AR(1) only)
 ar1_mu: 12.0
 ar1_sigma: 3.0
@@ -29,23 +35,28 @@ s_max: 100.0            # R1: order-up-to grid [0, 100] x 41
 gamma: 0.99
 lr_actor: 0.0003
 lr_critic: 0.001
-lr_step_episodes: 2000  # StepLR x0.5 every 2000 episodes (the reference's stabilizer)
+lr_step_episodes: 6000  # StepLR x0.5 every 6000 episodes. D-A1 (2000 over an 8000-ep
+#                         run) froze the policy at ep 6000; 6000 over 24000 stayed fluid.
 k_epochs: 4
 eps_clip: 0.1
 max_grad_norm: 0.2
-batch_episodes: 1       # update every episode (reference cadence)
+batch_episodes: 8       # D-A1: batch=1 gave grad norms 20-150 vs a 0.2 clip, so every
+#                         update was renormalised to the same size and the policy
+#                         random-walked (entropy never fell). batch=8 fixed it.
 ent_start: 0.02
 ent_end: 0.0
-anneal_episodes: 8000   # ABSOLUTE -- never derived from total_episodes (banned coupling)
+anneal_episodes: 24000  # ABSOLUTE -- never derived from total_episodes (banned coupling)
 warm_up: 0              # inert in v6 (on-policy, no running normalizer, nothing stored)
 #                         -- kept as a knob for parity experiments only
 
 # ----- budget (R4: no early stopping; milestones ARE the V(budget) axis) ------
-total_episodes: 8000
-budget_milestones: [1000, 2000, 4000, 8000]
+total_episodes: 24000
+budget_milestones: [2000, 6000, 12000, 24000]   # V(budget) axis; no extra training
 
 # ----- gates & diagnostics ----------------------------------------------------
-gate_every: 200
-gate_episodes_per_rho: 5   # 15 episodes per gate; 2 made best-checkpoint selection lottery-like
+gate_every: 400
+gate_episodes_per_rho: 15  # 45 episodes/gate; 5 gave SE ~1300, unusable for ranking
+select_on: monitor      # R7: monitor (held-out rho=0.9, seeds 60000+) | gate
+select_smooth: 3        # trailing mean over N criterion readings (1 = single draw)
 ev_canary: 0.05         # honest-EV floor; loud warning below this after canary_after
-canary_after: 3000
+canary_after: 6000

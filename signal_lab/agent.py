@@ -45,9 +45,16 @@ def _ortho(layer, gain):
 
 
 class SharedActor(nn.Module):
-    def __init__(self, msg_dim, hidden=256, bins=41, s_max=100.0):
+    def __init__(self, msg_dim, hidden=256, bins=41, s_max=100.0, msg_scale=100.0):
         super().__init__()
         self.M, self.H, self.bins = int(msg_dim), int(hidden), int(bins)
+        # R9: divisor applied to the incoming message. At 100 a demand signal (sd ~6.3
+        # at rho=0.9) enters with sd 0.063 -- 16x weaker in variation than the role
+        # one-hot -- so the net must grow a large weight to produce the order-up-to
+        # swings the conditional optimum needs. Lowering it makes the message a
+        # first-class input. Arm symmetry is untouched: 0/x == 0 for any x, so the
+        # nocomm channel stays identically zero and parameter counts are unchanged.
+        self.msg_scale = float(msg_scale)
         in_dim = OBS_DIM + N_AGENTS + self.M          # obs/100 || role one-hot || msg/100
         self.fc1 = _ortho(nn.Linear(in_dim, hidden), np.sqrt(2))
         self.fc2 = _ortho(nn.Linear(hidden, hidden), np.sqrt(2))
@@ -60,7 +67,7 @@ class SharedActor(nn.Module):
     def _inp(self, obs_t, msg_t):
         """obs_t [..., N, OBS_DIM] raw, msg_t [..., N, M] demand units -> input."""
         role = self.role.to(obs_t.device).expand(*obs_t.shape[:-1], N_AGENTS)
-        return torch.cat([obs_t / 100.0, role, msg_t / 100.0], dim=-1)
+        return torch.cat([obs_t / 100.0, role, msg_t / self.msg_scale], dim=-1)
 
     def cell(self, obs_t, msg_t, h):
         """One step for all N agents. -> (logits [N,bins], m_out [N,M], h')"""
