@@ -176,14 +176,19 @@ def main(argv=None):
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(os.path.join(root, "runs"), exist_ok=True)
-    if a.demand_family == "ar1":
-        fname = f"baselines_rho{a.rho:g}.json"
-    elif a.demand_family == "dr_poisson":
-        fname = (f"baselines_dp_{cfg['dr_lambda_lo']:g}-{cfg['dr_lambda_hi']:g}.json")
-    else:
+    # Keyed by the ANALYSIS label (--rho), not by the family: stats.py looks up
+    # baselines_rho<label>.json for the group it is analysing, so a dr_poisson cell
+    # analysed under label -1 must write baselines_rho-1.json. The regime itself is
+    # recorded INSIDE the payload (demand_family + dr bounds), so the file is still
+    # self-describing. Classic poisson keeps its own name (it is not a rho group).
+    if a.demand_family == "poisson":
         fname = f"baselines_poisson_mu{a.poisson_mu:g}.json"
+    else:
+        fname = f"baselines_rho{a.rho:g}.json"
     out = os.path.join(root, "runs", fname)
-    payload = {"demand_family": a.demand_family, "rho": a.rho, "static_bs": static_cost, "cond_bs": cond_cost,
+    payload = {"demand_family": a.demand_family, "rho": a.rho,
+               "dr_lambda_lo": cfg["dr_lambda_lo"], "dr_lambda_hi": cfg["dr_lambda_hi"],
+               "static_bs": static_cost, "cond_bs": cond_cost,
                "static_S": S.tolist(), "cond_a": av.tolist(), "cond_b": bv.tolist(),
                "eval_seed_base": EVAL_SEED_BASE, "eval_episodes": a.eval_episodes,
                "eval_seeds": eval_seeds,

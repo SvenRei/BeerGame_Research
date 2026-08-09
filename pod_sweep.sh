@@ -129,8 +129,11 @@ echo "== stage 2: baselines =="
 for r in ${RHOS_NEEDED//,/ }; do
   [[ -f "runs/baselines_rho${r}.json" ]] || $PY -m signal_lab.baselines --rho "$r"
 done
-[[ -n "$NEED_DP" && ! -f "runs/baselines_dp_${DR_LO}-${DR_HI}.json" ]] && \
-  $PY -m signal_lab.baselines --demand-family dr_poisson
+# DP cells are analysed under rho label -1, so their bars must land in
+# baselines_rho-1.json -- the file stats.py opens for that group.
+DP_RHO=$(printf '%s\n' "${CELLS[@]}" | awk -F'|' '$1=="dr_poisson"{print $2; exit}')
+[[ -n "$NEED_DP" && ! -f "runs/baselines_rho${DP_RHO}.json" ]] && \
+  $PY -m signal_lab.baselines --demand-family dr_poisson --rho "$DP_RHO"
 
 echo "== stage 3: training ($N_JOBS jobs, $WORKERS workers) =="
 JOBFILE=$(mktemp)

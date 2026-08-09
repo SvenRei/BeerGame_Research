@@ -344,7 +344,8 @@ def main(argv=None):
                           "state_absmean": f"{last_stats.get('state_absmean', float('nan')):.2f}"})
             for f in (ftr, fga, fup):
                 f.flush()
-            print(f"[signal] ep {ep:>6}  gate {g:8.1f}  monitor(0.9) {mon:8.1f}  "
+            _mlab = ("DP" if cfg.get("demand_family") == "dr_poisson" else "0.9")
+            print(f"[signal] ep {ep:>6}  gate {g:8.1f}  monitor({_mlab}) {mon:8.1f}  "
                   f"EV {last_stats.get('honest_ev', float('nan')):+.4f}{mark}", flush=True)
         if milestones and ep == milestones[0]:
             m = milestones.pop(0)
