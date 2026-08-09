@@ -92,6 +92,9 @@ echo "gauntlet: all green"
 
 # ---------------------------------------------------------------- 5 campaign
 step "5/7 campaign  (workers=$WORKERS seeds=$N_SEEDS from $SEED_START)"
+# self-heal: a Windows commit can reintroduce CRLF into the sweep, which bash may
+# or may not tolerate depending on where the \r lands. Strip them before running.
+sed -i 's/\r$//' pod_sweep.sh
 chmod +x pod_sweep.sh
 ./pod_sweep.sh plan
 if [[ "${PLAN_ONLY:-0}" == "1" ]]; then
