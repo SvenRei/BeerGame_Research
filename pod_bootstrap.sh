@@ -118,6 +118,8 @@ import matplotlib.pyplot as plt
 RE = re.compile(r"^(.*)_s(\d+)$")
 fam = {}
 for p in glob.glob("runs/stats_*.json"):
+    if "rho-3" in p or "rho-4" in p:        # OOD transfer: separate figure territory
+        continue
     d = json.load(open(p))
     for arm, pb in d.get("paired_vs_nocomm", {}).items():
         m = RE.match(arm)

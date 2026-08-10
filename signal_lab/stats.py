@@ -216,6 +216,9 @@ def baseline_block(d, bars, tost_margin):
     for name, ref in (("vs_static", st), ("vs_cond", cd)):
         out[name] = paired_block(ref, c, tost_margin)      # V = baseline - arm
     gap = st - cd                                          # per-episode gap width
+    if np.abs(gap.mean()) <= 1e-9:
+        out["gap_note"] = ("undefined: StaticBS == CondBS under this demand process "
+                           "(conditioning is worthless, e.g. rho=0)")
     if np.abs(gap.mean()) > 1e-9:
         recov = (st - c) / gap.mean()
         lo, hi = _bca_ci(recov)
@@ -304,6 +307,10 @@ def main(argv=None):
                          "training-seed suffix -- pairing across seeds would fold "
                          "training-seed variance into V.")
     ap.add_argument("--rho", type=float, default=0.9)
+    ap.add_argument("--tag", default="",
+                    help="appended to the output filename. REQUIRED whenever several "
+                         "analysis groups share a rho label (clip levels, beta levels), "
+                         "or each group silently overwrites the previous one's json.")
     ap.add_argument("--seed-base", type=int, default=10_000, dest="sb")
     ap.add_argument("--tost-margin", type=float, default=250.0,
                     help="symmetric equivalence margin for Schuirmann TOST (cost units)")
@@ -476,7 +483,8 @@ def main(argv=None):
                       f"{str(ag['sign_concordant']):>17}")
 
     os.makedirs(os.path.join(ROOT, "runs"), exist_ok=True)
-    opath = os.path.join(ROOT, "runs", f"{a.label}_rho{a.rho:g}.json")
+    opath = os.path.join(ROOT, "runs",
+                         f"{a.label}_rho{a.rho:g}{('_' + a.tag) if a.tag else ''}.json")
     with open(opath, "w") as f:
         json.dump(out, f, indent=1)
     print(f"\n[stats] wrote {opath}")

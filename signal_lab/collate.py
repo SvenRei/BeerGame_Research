@@ -92,9 +92,11 @@ def rows_from(path):
                            if vb.get("available") else "",
             "V_vs_static_p": (f"{_g(vb, 'vs_static', 't_p', default=float('nan')):.2e}"
                               if vb.get("available") else ""),
-            "gap_recovered": round(_g(vb, "gap_recovered", "mean",
-                                      default=float("nan")), 3)
-                             if vb.get("available") else "",
+            "gap_recovered": (round(_g(vb, "gap_recovered", "mean"), 3)
+                              if vb.get("available") and
+                                 isinstance(_g(vb, "gap_recovered", "mean",
+                                               default=None), float)
+                              else ("n/a: Static==Cond" if vb.get("gap_note") else "")),
             "gap_ci_lo": round(gci[0], 3) if gci[0] != "" else "",
             "gap_ci_hi": round(gci[1], 3) if gci[1] != "" else "",
             "listen_zeroed": round(z, 1) if z != "" else "",

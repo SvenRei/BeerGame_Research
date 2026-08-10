@@ -222,8 +222,9 @@ for key in $(printf '%s\n' "${CELLS[@]}" | awk -F'|' '{print $1"|"$2"|"$5"|"$6}'
       if [[ "$c" == "nocomm" ]]; then noc+="$tag,"; else arms+="$tag,"; fi
     done; done
   [[ -n "$arms" ]] || continue
+  GLABEL="${f}_b${b//./}$( [[ "$klip" != "-" ]] && echo "_cl${klip}" )"
   $PY -m signal_lab.stats --nocomm "${noc%,}" --arms "${arms%,}" --rho "$r" \
-      | tee "runs/stats_${f}_rho${r}_b${b//./}.txt"
+      --tag "$GLABEL" | tee "runs/stats_${f}_rho${r}_b${b//./}$( [[ "$klip" != "-" ]] && echo "_cl${klip}" ).txt"
 done
 
 echo "== stage 5b: OOD analysis =="
@@ -235,7 +236,7 @@ for lab in -3 -4; do
   done
   [[ -f "runs/$(echo "${arms%%,*}")/eval/seed10000_rho${lab}.json" ]] || continue
   $PY -m signal_lab.stats --nocomm "${noc%,}" --arms "${arms%,}" --rho "$lab" \
-      | tee "runs/stats_OOD_rho${lab}.txt"
+      --tag ood | tee "runs/stats_OOD_rho${lab}.txt"
 done
 
 echo "== stage 5c: consolidated results sheet =="
