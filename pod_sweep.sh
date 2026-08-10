@@ -89,7 +89,7 @@ check_supported() { local f=$1 r=$2 c=$3 t=$4
 }
 
 scale_for() { # family rho content -> divisor from runs/msg_scales.json (fail-closed)
-  $PY - "$1" "$2" "$3" <<'PYEOF'
+  $PY - "$1" "$2" "$3" "$DR_LO" "$DR_HI" <<'PYEOF'
 import json, sys
 fam, rho, content = sys.argv[1], sys.argv[2], sys.argv[3]
 key = (f"{fam}|rho{float(rho):g}" if fam == "ar1"
