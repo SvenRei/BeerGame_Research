@@ -98,6 +98,10 @@ key = (f"{fam}|rho{float(rho):g}" if fam == "ar1"
 t = json.load(open("runs/msg_scales.json"))
 if key not in t or content not in t[key]:
     sys.exit(f"FAIL-CLOSED: no registered divisor for ({key},{content}) -- run stage 1")
+if t[key][content] is None:
+    sys.exit(f"FAIL-CLOSED: content '{content}' is DEGENERATE (constant message) at "
+             f"{key}; its divisor is undefined and the cell is informationless -- "
+             f"remove it from CELLS")
 print(t[key][content])
 PYEOF
 }
@@ -222,9 +226,13 @@ for key in $(printf '%s\n' "${CELLS[@]}" | awk -F'|' '{print $1"|"$2"|"$5"|"$6}'
       if [[ "$c" == "nocomm" ]]; then noc+="$tag,"; else arms+="$tag,"; fi
     done; done
   [[ -n "$arms" ]] || continue
-  GLABEL="${f}_b${b//./}$( [[ "$klip" != "-" ]] && echo "_cl${klip}" )"
+  # NOTE the if-form: `[[ ... ]] && X` inside an assignment returns 1 when the test
+  # is false, and under `set -e` that kills the whole script -- silently, before the
+  # first stats call. That exact failure shipped once; keep the explicit if.
+  GLABEL="${f}_b${b//./}"
+  if [[ "$klip" != "-" ]]; then GLABEL="${GLABEL}_cl${klip}"; fi
   $PY -m signal_lab.stats --nocomm "${noc%,}" --arms "${arms%,}" --rho "$r" \
-      --tag "$GLABEL" | tee "runs/stats_${f}_rho${r}_b${b//./}$( [[ "$klip" != "-" ]] && echo "_cl${klip}" ).txt"
+      --tag "$GLABEL" | tee "runs/stats_${f}_rho${r}_${GLABEL}.txt"
 done
 
 echo "== stage 5b: OOD analysis =="

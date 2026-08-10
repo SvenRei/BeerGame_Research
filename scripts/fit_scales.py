@@ -51,7 +51,16 @@ def measure(env_cfg, provider_cfg, forecaster_path):
                 vals.append(float(inc[1, 0]))
                 obs, _, done, _ = env.step(rng.integers(0, 41, 4))
         sd = float(np.std(vals))
-        out[c] = round(max(sd, 1e-6), 1)
+        if sd < 1e-3:
+            # constant message (e.g. arpred at rho=0 is identically mu): the divisor is
+            # undefined and the content is informationless in this regime. Record null;
+            # any cell that requests it FAILS CLOSED in scale_for rather than dividing
+            # by zero or shipping an arbitrary constant.
+            out[c] = None
+            print(f"  {c:<8} sd {sd:8.2f}  -> DEGENERATE (constant message; divisor "
+                  f"null, cells requesting it fail closed)")
+            continue
+        out[c] = round(sd, 1)
         print(f"  {c:<8} sd {sd:8.2f}  -> divisor {out[c]}")
     out["learned"] = 100.0
     out["nocomm"] = 100.0                          # inert: channel is identically zero
