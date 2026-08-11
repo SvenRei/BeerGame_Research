@@ -154,7 +154,18 @@ def evaluate(ckpt_path, episodes=50, rho=None, intervention="honest",
             "cost_back": (b * tr["back"]).sum(0).tolist(),
             "orders": tr["orders"].tolist(),          # [T, N] executed orders
             "demand": tr["demand"].tolist(),          # [T]  realized customer demand
-            "back_retailer": tr["back"][:, 0].tolist(),
+            # Per-step, per-echelon state. Costs are only summed above, and only the
+            # retailer's backlog was persisted -- which makes several DESCRIPTIVE
+            # analyses impossible to do post hoc without re-running the campaign:
+            # inventory oscillation by echelon, where and when cost accumulates, the
+            # shock-response profile in inventory (not just order) terms, and
+            # backlog propagation upstream. Descriptive work is exploratory and must
+            # NOT be pre-registered -- but the raw material for it has to be captured
+            # while the checkpoints exist. Adds ~0.1 MB per dump against a 14 MB run.
+            "inv": tr["inv"].tolist(),                # [T, N] on-hand by echelon
+            "back": tr["back"].tolist(),              # [T, N] backlog by echelon
+            "cost_step": tr["cost"].tolist(),         # [T, N] per-period cost
+            "back_retailer": tr["back"][:, 0].tolist(),   # kept: existing analyses use it
             "actions": tr["act"].tolist(),            # [T, N] S-bin indices
             "msg0": tr["msg"][:, :, 0].tolist(),      # [T, N] incoming channel slot 0
             "d_prev": tr["obs"][:, 0, 3].tolist(),    # [T]  retailer's observed d_{t-1}
