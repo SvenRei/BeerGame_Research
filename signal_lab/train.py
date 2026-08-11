@@ -330,7 +330,13 @@ def main(argv=None):
         if ep % int(cfg["gate_every"]) == 0:
             g = gate_eval(actor, provider, cfg, GATE_RHOS, GATE_SEED_BASE,
                           int(cfg["gate_episodes_per_rho"]))
-            mon_rho = float(cfg["rho"]) if MONITOR_RHO is None else MONITOR_RHO
+            # Non-AR families ignore ar1_rho entirely (their demand comes from the
+            # vendored family branch), so the label value is inert there -- but pin it
+            # to a legal number anyway so the monitor env can never be built with a
+            # nonsense rho if a future family starts reading it.
+            mon_rho = (float(cfg["rho"]) if MONITOR_RHO is None else MONITOR_RHO)
+            if cfg.get("demand_family", "ar1") != "ar1":
+                mon_rho = 0.0
             mon = gate_eval(actor, provider, cfg, (mon_rho,), MONITOR_SEED_BASE,
                             int(cfg["gate_episodes_per_rho"]))
             mark = ""

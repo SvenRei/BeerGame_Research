@@ -80,12 +80,26 @@ for b in 0 0.5; do for c in nocomm dhatc; do
 # F3 robustness cell: backorder-heavy regime (b/h = 4), raw + nocomm only.
 for c in nocomm raw; do CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-|4"); done
 
+# ---------------------------------------------------------------- H2 RE-RUN BLOCK
+# The rho-grid cells were selected by a monitor hardcoded to rho=0.9 (R7-FIX in
+# signal_lab/train.py). Symptom: nocomm-vs-StaticBS degraded monotonically with
+# |rho - 0.9| (-803 / -309 / +68 / -28) while seed CV rose to 0.34. Same recipe, same
+# 24000 episodes -- ONLY the selector changes -- so this is a re-selection, not a
+# budget deviation. Tagged _v2 so the original cells stay on disk for before/after.
+# Enable with:  H2_RERUN=1 ./pod_sweep.sh run
+if [[ "${H2_RERUN:-0}" == "1" ]]; then
+  CELLS=()
+  for r in 0 0.3 0.6; do for c in nocomm raw dhatc; do
+    CELLS+=("ar1|$r|$c|retailer_broadcast|1.0|-|-"); done; done
+  TAG_SUFFIX="_v2"
+fi
+
 SUPPORTED_CONTENT="nocomm raw arpred dhatc ip learned raw_lag1 raw_lag2"
 SUPPORTED_TOPO="retailer_broadcast neighbor upstream_only downstream_only manufacturer_broadcast no_neighbor"
 SUPPORTED_FAMILY="ar1 poisson dr_poisson"
 
 tag_of() { local f=$1 r=$2 c=$3 t=$4 b=$5 s=$6 cl=$7 bh=${8:--}
-  local base="C_${f}_r${r//./}_${c}_${t:0:4}_b${b//./}"
+  local base="C_${f}_r${r//./}_${c}_${t:0:4}_b${b//./}${TAG_SUFFIX:-}"
   if [[ "$cl" != "-" ]]; then base="${base}_cl${cl}"; fi
   if [[ "$bh" != "-" ]]; then base="${base}_bh${bh}"; fi
   echo "${base}_s${s}"; }
