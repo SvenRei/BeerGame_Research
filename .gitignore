@@ -3,4 +3,7 @@ figs/
 __pycache__/
 *.pyc
 .venv/
+archive/
+campaign_20260811T045409Z.tar.gz
 docs/REGISTRY_OUTCOMES.md
+h2rerun_20260811T112302Z.tar.gz

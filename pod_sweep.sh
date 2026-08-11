@@ -222,28 +222,51 @@ for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
   done; done
 echo "   in-distribution evaluation complete."
 
-echo "== stage 4b: ZERO-SHOT OOD transfer (nocomm vs raw, ar1 rho=.9 policies) =="
+echo "== stage 4b: ZERO-SHOT OOD transfer (ALL rho=.9 arms) =="
 # Policies trained on ar1 are evaluated, WITHOUT retraining, on the vendored stress
 # decks. Training on those decks would be confounded (fixed calendar, memorisable);
 # transferring to them is not -- the schedule is unanticipated, so the retailer's
 # observation is a genuine early warning. Labels keep dumps disjoint.
+# 1020 forward-pass evaluations: queue them and run WORKERS-parallel like stage 3,
+# otherwise this stage alone is ~2.3 h serial.
+OODJOBS=$(mktemp)
 for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
-  [[ "$f" == "ar1" && "$r" == "0.9" && "$cl" == "-" && "$t" == "retailer_broadcast" ]] || continue
-  [[ "$c" == "nocomm" || "$c" == "raw" ]] || continue
+  # H-SHOCK EXTENSION: transfer EVERY in-distribution rho=0.9 arm, not just nocomm+raw.
+  # Costs no training -- these are forward passes on checkpoints the campaign already
+  # produced -- and it turns H-SHOCK from a single-content, single-topology claim into
+  # a full mechanism test:
+  #   * contents  -> does the early-warning premium depend on WHAT is sent? (arpred is
+  #     an AR-calibrated shrinkage rule and dhatc an AR-certified neural forecaster;
+  #     both face inputs outside their calibration under a shock, so brittleness by
+  #     message type becomes measurable.)
+  #   * topologies -> H-SOURCE under shock. Relay costs 524 in distribution; each hop's
+  #     delay compounds against a level change, so the penalty should be LARGER OOD.
+  #   * lags       -> H-TIME under shock. A stale statistic is mildly worse; a stale
+  #     WARNING is nearly worthless, so the endpoint gap should exceed its 226.
+  #   * placebos   -> falsification: downstream_only / no_neighbor must stay flat OOD.
+  #     If a self-echo acquires value under shock, the early-warning story is wrong.
+  # Excluded by design: clip and b/h cells (different observation map / cost regime,
+  # so their nocomm reference is not the one used here) and non-ar1 families.
+  [[ "$f" == "ar1" && "$r" == "0.9" && "$cl" == "-" && "$bh" == "-" && "$b" == "1.0" ]] || continue
   for sc_pair in "black_swan:-3" "extreme_chaos:-4"; do
     sc="${sc_pair%%:*}"; lab="${sc_pair##*:}"
     for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
       [[ -f "runs/$tag/eval/seed10000_rho${lab}.json" ]] || \
-        $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 \
-            --scenario "$sc" --rho "$lab" >>"runs/logs/$tag.log" 2>&1
+        echo "$PY -m signal_lab.evaluate --ckpt runs/$tag/ckpt_best.pt --episodes 50 \
+             --scenario $sc --rho $lab >> runs/logs/$tag.log 2>&1" >>"$OODJOBS"
       if [[ "$c" != "nocomm" ]]; then for iv in zeroed shuffled; do
         [[ -f "runs/$tag/eval/seed10000_rho${lab}_${iv}.json" ]] || \
-          $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 \
-              --scenario "$sc" --rho "$lab" --intervention "$iv" >>"runs/logs/$tag.log" 2>&1
+          echo "$PY -m signal_lab.evaluate --ckpt runs/$tag/ckpt_best.pt --episodes 50 \
+               --scenario $sc --rho $lab --intervention $iv >> runs/logs/$tag.log 2>&1" >>"$OODJOBS"
       done; fi
     done
   done
 done
+if [[ -s "$OODJOBS" ]]; then
+  echo "   $(wc -l <"$OODJOBS") OOD evaluations, $WORKERS workers"
+  xargs -a "$OODJOBS" -d'\n' -P "$WORKERS" -I{} bash -c '{}'
+fi
+rm -f "$OODJOBS"
 # OOD reference bars: a base-stock policy fitted ON the shock (the "oracle who knew")
 for sc_pair in "black_swan:-3" "extreme_chaos:-4"; do
   sc="${sc_pair%%:*}"; lab="${sc_pair##*:}"
@@ -277,10 +300,18 @@ echo "== stage 5b: OOD analysis =="
 for lab in -3 -4; do
   noc=""; arms=""
   for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k))
-    noc+="$(tag_of ar1 0.9 nocomm retailer_broadcast 1.0 "$s" -),"
-    arms+="$(tag_of ar1 0.9 raw retailer_broadcast 1.0 "$s" -),"
+    noc+="$(tag_of ar1 0.9 nocomm retailer_broadcast 1.0 "$s" - -),"
   done
-  [[ -f "runs/$(echo "${arms%%,*}")/eval/seed10000_rho${lab}.json" ]] || continue
+  # every transferred arm, paired against the same matched nocomm references
+  for cell in "${CELLS[@]}"; do IFS='|' read -r f2 r2 c2 t2 b2 cl2 bh2 <<<"$cell"
+    [[ "$f2" == "ar1" && "$r2" == "0.9" && "$cl2" == "-" && "$bh2" == "-" && "$b2" == "1.0" ]] || continue
+    [[ "$c2" == "nocomm" ]] && continue
+    for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k))
+      tg=$(tag_of "$f2" "$r2" "$c2" "$t2" "$b2" "$s" "$cl2" "$bh2")
+      [[ -f "runs/$tg/eval/seed10000_rho${lab}.json" ]] && arms+="$tg,"
+    done
+  done
+  [[ -n "$arms" ]] || continue
   $PY -m signal_lab.stats --nocomm "${noc%,}" --arms "${arms%,}" --rho "$lab" \
       --tag ood | tee "runs/stats_OOD_rho${lab}.txt"
 done
