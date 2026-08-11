@@ -433,6 +433,52 @@ def t_costs():
     print("T-COSTS   cost regime reaches env, physics invariant, costs shift OK")
 
 
+def t_dobs():
+    """do(obs) for P2: scrambles ONLY the non-retailer incoming-order field, preserves
+    its marginal distribution, leaves the retailer and the physics untouched."""
+    from env.beer_game import BeerGame
+    from signal_lab.evaluate import _ObsScrambler
+    rng = np.random.default_rng(11)
+    acts = [rng.integers(0, 40, 4) for _ in range(30)]
+
+    def roll(mode):
+        e = BeerGame({"ar1_rho": 0.9})
+        w = _ObsScrambler(e, mode, seed=5) if mode != "obs_honest" else e
+        o = w.reset(seed=31); O, C = [o.copy()], []
+        for a in acts:
+            o, c, d, _ = w.step(a); O.append(o.copy()); C.append(c.copy())
+            if d: break
+        return np.array(O), np.array(C)
+
+    Oh, Ch = roll("obs_honest")
+    Os, Cs = roll("obs_shuffled")
+    # physics untouched: the same actions produce the same COSTS
+    np.testing.assert_array_equal(Ch, Cs)
+    # retailer never touched, in ANY field
+    np.testing.assert_array_equal(Oh[:, 0, :], Os[:, 0, :])
+    # non-retailer fields 0-2 (inventory/backlog/on_order) untouched
+    np.testing.assert_array_equal(Oh[:, 1:, :3], Os[:, 1:, :3])
+    # temporal resample: every emitted value must be one the SAME stage genuinely
+    # observed at some point (marginal preserved), but not the current one
+    for i in range(3):
+        seen = set(np.round(Oh[:, i + 1, 3], 6))
+        assert set(np.round(Os[:, i + 1, 3], 6)) <= seen, f"invented a value, stage {i}"
+    assert not np.array_equal(Oh[:, 1:, 3], Os[:, 1:, 3]), "scramble was a no-op"
+    # and it must bite even when all upstream stages carry IDENTICAL values --
+    # the cross-sectional permutation it replaces was provably a no-op there
+    e2 = BeerGame({"ar1_rho": 0.9}); w2 = _ObsScrambler(e2, "obs_shuffled", seed=5)
+    o2 = w2.reset(seed=31); seq = [o2[1:, 3].copy()]
+    for a in acts[:20]:
+        o2, _, d2, _ = w2.step(np.full(4, 12)); seq.append(o2[1:, 3].copy())
+        if d2: break
+    assert len({tuple(np.round(x, 3)) for x in seq}) > 1, "constant-policy case not covered"
+    # zeroed variant blanks exactly that field
+    Oz, Cz = roll("obs_zeroed")
+    np.testing.assert_array_equal(Ch, Cz)
+    assert np.all(Oz[:, 1:, 3] == 0.0) and np.any(Oz[:, 0, 3] != 0.0)
+    print("T-DOBS    do(obs) scrambles only upstream last_incoming, physics intact OK")
+
+
 def t_smoke():
     tag = "_smoke_nocomm_s60"
     run = os.path.join(ROOT, "runs", tag)
@@ -491,6 +537,7 @@ def t_sweep():
 
 if __name__ == "__main__":
     t_env(); t_arpred(); t_interv(); t_frozen(); t_param(); t_sym(); t_grad()
-    t_stats(); t_dp(); t_p2(); t_geo(); t_lag(); t_ood(); t_costs(); t_smoke(); t_sweep()
+    t_stats(); t_dp(); t_p2(); t_geo(); t_lag(); t_ood(); t_costs(); t_dobs()
+    t_smoke(); t_sweep()
     print("\nALL TESTS PASS -- the arm-symmetry, gradient-isolation, and fail-closed "
           "contracts hold.")

@@ -220,6 +220,30 @@ for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
         $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 --rho "$r" --intervention "$iv" >>"runs/logs/$tag.log" 2>&1
     done; fi
   done; done
+# P2 DIRECT TEST -- do(obs). Scramble the OBSERVED incoming-order field of the three
+# upstream stages on already-trained policies. P2's between-arm null infers that
+# no-communication policies never mined the order stream for demand; this measures it.
+# Pre-registered read: if cost(nocomm | obs_shuffled) - cost(nocomm | honest) is ~0,
+# the policy provably ignores that history and Raghunathan's redundancy mechanism is
+# ABSENT under learning. A large positive delta would refute the P2 interpretation and
+# mean the clip simply failed to bind. Run on nocomm AND raw (raw is the contrast: it
+# has a channel, so it should depend on the order stream even less).
+DOBSJOBS=$(mktemp)
+for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
+  [[ "$f" == "ar1" && "$r" == "0.9" && "$cl" == "-" && "$bh" == "-" && "$b" == "1.0" \
+     && "$t" == "retailer_broadcast" ]] || continue
+  [[ "$c" == "nocomm" || "$c" == "raw" ]] || continue
+  for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
+    [[ -f "runs/$tag/eval/seed10000_rho${r}_obs_shuffled.json" ]] || \
+      echo "$PY -m signal_lab.evaluate --ckpt runs/$tag/ckpt_best.pt --episodes 50 \
+           --rho $r --obs-intervention obs_shuffled >> runs/logs/$tag.log 2>&1" >>"$DOBSJOBS"
+  done
+done
+if [[ -s "$DOBSJOBS" ]]; then
+  echo "   $(wc -l <"$DOBSJOBS") do(obs) evaluations (P2 direct test), $WORKERS workers"
+  xargs -a "$DOBSJOBS" -d'\n' -P "$WORKERS" -I{} bash -c '{}'
+fi
+rm -f "$DOBSJOBS"
 echo "   in-distribution evaluation complete."
 
 echo "== stage 4b: ZERO-SHOT OOD transfer (ALL rho=.9 arms) =="

@@ -57,8 +57,70 @@ def load_checkpoint(path):
     return actor, critic, provider, cfg
 
 
+class _ObsScrambler:
+    """do(obs) for P2: destroy the demand information carried by a stage's OBSERVED
+    incoming orders, at evaluation time, on an already-trained policy.
+
+    P2's between-arm design infers the mechanism -- garble the order stream, observe
+    that nothing changes, conclude the policy never used it. A referee can answer
+    "maybe the clip did not bind where it mattered". This tests the claim directly: if
+    a trained NOCOMM policy's cost is unchanged when its observed order history is
+    scrambled, it demonstrably does not use that history, and Raghunathan's redundancy
+    mechanism is absent rather than merely unmeasured.
+
+    Semantics: the marginal distribution of the field is preserved and only its
+    TEMPORAL alignment with the current state is destroyed -- each stage's observed
+    incoming order is replaced by a uniform draw from that same stage's own history of
+    observed values. Permuting ACROSS stages (do(m)'s scheme) is the wrong control
+    here and is provably a no-op whenever the upstream stages carry similar order
+    magnitudes, which is the common case; "mining the order stream for demand" is a
+    claim about time, so the intervention must break time. The RETAILER IS NEVER TOUCHED -- its
+    last_incoming IS customer demand, and scrambling it would remove the private
+    observation every arm depends on, testing something else entirely.
+
+    Wraps the env: physics, transitions and costs are untouched; only what the actor
+    READS is altered. `obs` is [N, 4] with field 3 = last_incoming.
+    """
+
+    FIELD = 3
+    STAGES = slice(1, 4)          # wholesaler, distributor, manufacturer
+
+    def __init__(self, env, mode, seed=0):
+        self._e = env
+        self.mode = mode
+        self.rng = np.random.default_rng(seed + 777)
+        self._hist = [[] for _ in range(4)]
+
+    def _apply(self, obs):
+        if self.mode == "obs_honest":
+            return obs
+        o = obs.copy()
+        if self.mode == "obs_zeroed":
+            o[self.STAGES, self.FIELD] = 0.0
+            return o
+        # obs_shuffled: record the true value, emit a random PAST value of the same
+        # stage. Marginal preserved, temporal alignment destroyed. Before any history
+        # exists the value passes through unchanged (nothing to resample from).
+        for i in range(self.STAGES.start, self.STAGES.stop):
+            self._hist[i].append(float(obs[i, self.FIELD]))
+            if len(self._hist[i]) > 1:
+                o[i, self.FIELD] = self._hist[i][self.rng.integers(len(self._hist[i]))]
+        return o
+
+    def reset(self, **kw):
+        self._hist = [[] for _ in range(4)]      # never bleed across episodes
+        return self._apply(self._e.reset(**kw))
+
+    def step(self, a):
+        obs, c, d, i = self._e.step(a)
+        return self._apply(obs), c, d, i
+
+    def __getattr__(self, k):      # h, b, t, last_incoming, max_order, ...
+        return getattr(self._e, k)
+
+
 def evaluate(ckpt_path, episodes=50, rho=None, intervention="honest",
-             seed_base=EVAL_SEED_BASE, scenario=None):
+             seed_base=EVAL_SEED_BASE, scenario=None, obs_intervention="obs_honest"):
     """scenario: zero-shot OOD transfer. Overrides the DEMAND PROCESS only -- the
     policy, the message content, and msg_scale all stay exactly as trained. The
     divisor is deliberately NOT re-measured on the new regime: recalibrating it would
@@ -76,6 +138,8 @@ def evaluate(ckpt_path, episodes=50, rho=None, intervention="honest",
                     "poisson_mu": cfg.get("poisson_mu", 8.0),
                     "ar1_rho": rho, "ar1_mu": cfg["ar1_mu"],
                     "ar1_sigma": cfg["ar1_sigma"]})
+    if obs_intervention != "obs_honest":
+        env = _ObsScrambler(env, obs_intervention, seed=seed_base)
     costs, recs = {}, []
     for k in range(int(episodes)):
         tr = play_episode(env, actor, provider, seed_base + k,
@@ -109,6 +173,10 @@ def main(argv=None):
     ap.add_argument("--intervention", default="honest",
                     choices=("honest", "zeroed", "shuffled", "cross"))
     ap.add_argument("--seed-base", type=int, default=EVAL_SEED_BASE, dest="sb")
+    ap.add_argument("--obs-intervention", default="obs_honest", dest="oiv",
+                    choices=("obs_honest", "obs_shuffled", "obs_zeroed"),
+                    help="do(obs) for P2: scramble the OBSERVED incoming-order field "
+                         "for non-retailers on a trained policy. Retailer untouched.")
     ap.add_argument("--scenario", default=None,
                     choices=("black_swan", "extreme_chaos", "poisson", "ar1"),
                     help="zero-shot OOD evaluation: swap the demand process only. "
@@ -126,10 +194,12 @@ def main(argv=None):
         print(f"[eval] scenario={a.scenario} -> analysis label rho={lab:g} "
               f"(registered; keeps OOD dumps disjoint from in-distribution)")
     costs, recs, cfg, rho = evaluate(a.ckpt, a.episodes, a.rho, a.intervention, a.sb,
-                                     scenario=a.scenario)
+                                     scenario=a.scenario, obs_intervention=a.oiv)
     out_dir = os.path.join(os.path.dirname(os.path.abspath(a.ckpt)), "eval")
     os.makedirs(out_dir, exist_ok=True)
     suffix = "" if a.intervention == "honest" else f"_{a.intervention}"
+    if a.oiv != "obs_honest":
+        suffix += f"_{a.oiv}"          # disjoint dumps; never overwrites do(m) results
     # ckpt_best is the canonical arm result and keeps the contract filename that
     # report.py / stats.py read. Any OTHER checkpoint (final, budget milestones) is
     # namespaced, so scoring it can never silently overwrite the arm's headline number.
@@ -146,7 +216,8 @@ def main(argv=None):
                    "episodes": int(a.episodes), "per_episode": recs}, f)
     m = float(np.mean(list(costs.values())))
     print(f"[eval] {os.path.basename(os.path.dirname(os.path.abspath(a.ckpt)))}  "
-          f"content={cfg['content']} intervention={a.intervention} rho={rho:g}"
+          f"content={cfg['content']} intervention={a.intervention}"
+          f"{'' if a.oiv == 'obs_honest' else '/' + a.oiv} rho={rho:g}"
           f"{'' if not a.scenario else '  OOD-scenario=' + a.scenario}  "
           f"episodes={a.episodes}  mean team cost {m:.1f}")
     print(f"[eval] arch: hidden={cfg['hidden']} bins={cfg['act_bins']} "
