@@ -220,6 +220,33 @@ for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
         $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 --rho "$r" --intervention "$iv" >>"runs/logs/$tag.log" 2>&1
     done; fi
   done; done
+# H-BUDGET -- the substitution curve. train.py already SAVES ckpt_budget<N>.pt at each
+# milestone (2k/6k/12k/24k) at no extra training cost, but nothing ever scored them, so
+# the registered V(budget) axis produced no data. Registered read: information sharing
+# and learning time are partial SUBSTITUTES, so V should DECLINE as the budget grows --
+# a longer-trained no-communication policy closes part of the gap on its own. If V is
+# flat in budget, information and computation are complements, not substitutes, at this
+# scale. evaluate.py namespaces non-best checkpoints (__ckpt_budget<N>), so these dumps
+# can never overwrite the headline arm result. Restricted to the F_CONTENT ladder.
+BUDJOBS=$(mktemp)
+for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
+  [[ "$f" == "ar1" && "$r" == "0.9" && "$cl" == "-" && "$bh" == "-" && "$b" == "1.0" \
+     && "$t" == "retailer_broadcast" ]] || continue
+  for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
+    for m in 2000 6000 12000; do          # 24000 == ckpt_best's budget, already scored
+      [[ -f "runs/$tag/ckpt_budget${m}.pt" ]] || continue
+      [[ -f "runs/$tag/eval/seed10000_rho${r}__ckpt_budget${m}.json" ]] || \
+        echo "$PY -m signal_lab.evaluate --ckpt runs/$tag/ckpt_budget${m}.pt --episodes 50 \
+             --rho $r >> runs/logs/$tag.log 2>&1" >>"$BUDJOBS"
+    done
+  done
+done
+if [[ -s "$BUDJOBS" ]]; then
+  echo "   $(wc -l <"$BUDJOBS") budget-milestone evaluations (H-BUDGET), $WORKERS workers"
+  xargs -a "$BUDJOBS" -d'\n' -P "$WORKERS" -I{} bash -c '{}'
+fi
+rm -f "$BUDJOBS"
+
 # P2 DIRECT TEST -- do(obs). Scramble the OBSERVED incoming-order field of the three
 # upstream stages on already-trained policies. P2's between-arm null infers that
 # no-communication policies never mined the order stream for demand; this measures it.
