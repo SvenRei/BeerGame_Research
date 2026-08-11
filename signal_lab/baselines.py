@@ -150,6 +150,8 @@ def fit_cond(cfg, seeds, S0):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--rho", type=float, default=0.9)
+    ap.add_argument("--holding-cost", type=float, default=0.5)
+    ap.add_argument("--backorder-cost", type=float, default=1.0)
     ap.add_argument("--demand-family", default="ar1",
                     choices=("ar1", "poisson", "dr_poisson",
                              "black_swan", "extreme_chaos"))
@@ -157,7 +159,8 @@ def main(argv=None):
     ap.add_argument("--fit-episodes", type=int, default=12)
     ap.add_argument("--eval-episodes", type=int, default=50)
     a = ap.parse_args(argv)
-    cfg = {"demand_family": a.demand_family, "ar1_rho": a.rho, "ar1_mu": 12.0,
+    cfg = {"holding_cost": a.holding_cost, "backorder_cost": a.backorder_cost,
+           "demand_family": a.demand_family, "ar1_rho": a.rho, "ar1_mu": 12.0,
            "ar1_sigma": 3.0, "poisson_mu": a.poisson_mu,
            "dr_lambda_lo": 4.0, "dr_lambda_hi": 24.0}
     fit_seeds = [FIT_SEED_BASE + k for k in range(a.fit_episodes)]
@@ -193,7 +196,9 @@ def main(argv=None):
     if a.demand_family == "poisson":
         fname = f"baselines_poisson_mu{a.poisson_mu:g}.json"
     else:
-        fname = f"baselines_rho{a.rho:g}.json"
+        bh = a.backorder_cost / a.holding_cost
+        suffix = "" if abs(bh - 2.0) < 1e-9 else f"_bh{bh:g}"
+        fname = f"baselines_rho{a.rho:g}{suffix}.json"
     out = os.path.join(root, "runs", fname)
     payload = {"demand_family": a.demand_family, "rho": a.rho,
                "dr_lambda_lo": cfg["dr_lambda_lo"], "dr_lambda_hi": cfg["dr_lambda_hi"],

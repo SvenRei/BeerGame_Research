@@ -34,17 +34,22 @@ EPISODES="${EPISODES:-24000}"
 PY="${PY:-python3}"
 
 # ------------------------------------------------------------------ declared cells
-# Each line: family|rho|content|topology|beta|clip   ("-" = no garbling)
+# Each line: family|rho|content|topology|beta|clip|bh   ("-" = default)
+#   bh = backorder/holding ratio. "-" keeps the registered 0.5/1.0 (b/h = 2).
+# LOW_RHO_EPISODES (default = EPISODES) extends the budget for rho < 0.9 cells only:
+#   the campaign showed nocomm seed-CV of 0.17-0.34 there vs 0.018 at rho=0.9, i.e.
+#   an unconverged control, which is what broke H2's registered grid. The extension
+#   is applied IDENTICALLY to comm and nocomm arms so the comparison stays fair.
 DR_LO="${DR_LO:-4}"; DR_HI="${DR_HI:-24}"
 CELLS=()
 # F_CONTENT ladder @ rho .9 (retailer_broadcast, beta 1)
 for c in nocomm raw arpred dhatc ip learned; do
-  CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-"); done
+  CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-|-"); done
 # P1 (DP side): regime uncertainty, forecast (arpred) vs raw vs nocomm.
 # rho label -1 keeps DP files/stats DISJOINT from the AR rho=0 group -- otherwise the
 # analysis stage would pair DP arms against AR baselines on the shared label.
 for c in nocomm raw arpred; do
-  CELLS+=("dr_poisson|-1|$c|retailer_broadcast|1.0|-"); done
+  CELLS+=("dr_poisson|-1|$c|retailer_broadcast|1.0|-|-"); done
 # P2 (garbling): clip levels chosen by the REGISTERED pre-flight audit
 # (scripts/audit_garbling.py): c=6 destroys 62% of linearly-recoverable demand info
 # from the order stream, c=8 destroys 47%. The originally planned c in {12,20} was
@@ -52,33 +57,37 @@ for c in nocomm raw arpred; do
 # there would have been uninformative. Blackwell nesting min(o,6)=min(min(o,8),6)
 # still holds, so the dose ordering Gamma(6) >= Gamma(8) >= 0 is well posed.
 for cl in 6 8; do for c in nocomm raw; do
-  CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|$cl"); done; done
+  CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|$cl|-"); done; done
 # F_GEOMETRY on raw @ rho .9. retailer_broadcast is the direct-source arm (reused from
 # F_CONTENT). upstream_only is the RELAYED arm -- H-SOURCE contrasts the two. The rest
 # are placebos: downstream_only echoes each agent's own past order back at it, and
 # no_neighbor wires nobody to anybody (bit-identical to nocomm; V must be EXACTLY 0).
 for t in upstream_only downstream_only manufacturer_broadcast no_neighbor; do
-  CELLS+=("ar1|0.9|raw|$t|1.0|-"); done
+  CELLS+=("ar1|0.9|raw|$t|1.0|-|-"); done
 # H-TIME: staleness gradient (raw itself is lag 0, reused from F_CONTENT)
 for c in raw_lag1 raw_lag2; do
-  CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-"); done
+  CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-|-"); done
 # H2 rho-gradient on raw with matched nocomm (per-rho pairing partner) + dhatc contrast
 for r in 0 0.3 0.6; do for c in nocomm raw dhatc; do
-  CELLS+=("ar1|$r|$c|retailer_broadcast|1.0|-"); done; done
+  CELLS+=("ar1|$r|$c|retailer_broadcast|1.0|-|-"); done; done
 # F_INCENTIVE: dhatc-only vs matched-beta nocomm
 for b in 0 0.5; do for c in nocomm dhatc; do
-  CELLS+=("ar1|0.9|$c|retailer_broadcast|$b|-"); done; done
+  CELLS+=("ar1|0.9|$c|retailer_broadcast|$b|-|-"); done; done
 # --- still outside this build (plan-time fail-close names them):
 #UNSUPPORTED: content eps,dhat_ip,true_lambda      (messages.py rungs)
 #UNSUPPORTED: QMIX second learner                  (legacy harness or descope)
+
+# F3 robustness cell: backorder-heavy regime (b/h = 4), raw + nocomm only.
+for c in nocomm raw; do CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-|4"); done
 
 SUPPORTED_CONTENT="nocomm raw arpred dhatc ip learned raw_lag1 raw_lag2"
 SUPPORTED_TOPO="retailer_broadcast neighbor upstream_only downstream_only manufacturer_broadcast no_neighbor"
 SUPPORTED_FAMILY="ar1 poisson dr_poisson"
 
-tag_of() { local f=$1 r=$2 c=$3 t=$4 b=$5 s=$6 cl=$7
+tag_of() { local f=$1 r=$2 c=$3 t=$4 b=$5 s=$6 cl=$7 bh=${8:--}
   local base="C_${f}_r${r//./}_${c}_${t:0:4}_b${b//./}"
-  [[ "$cl" != "-" ]] && base="${base}_cl${cl}"
+  if [[ "$cl" != "-" ]]; then base="${base}_cl${cl}"; fi
+  if [[ "$bh" != "-" ]]; then base="${base}_bh${bh}"; fi
   echo "${base}_s${s}"; }
 
 check_supported() { local f=$1 r=$2 c=$3 t=$4
@@ -140,6 +149,12 @@ echo "== stage 2: baselines =="
 for r in ${RHOS_NEEDED//,/ }; do
   [[ -f "runs/baselines_rho${r}.json" ]] || $PY -m signal_lab.baselines --rho "$r"
 done
+# F3: the robustness cell needs its OWN bars -- costs change the optimal base stock.
+for bh in $(printf '%s\n' "${CELLS[@]}" | awk -F'|' '$7!="-"{print $7}' | sort -u); do
+  [[ -f "runs/baselines_rho0.9_bh${bh}.json" ]] || \
+    $PY -m signal_lab.baselines --rho 0.9 --holding-cost 0.5 \
+        --backorder-cost "$(python3 -c "print(0.5*$bh)")"
+done
 # DP cells are analysed under rho label -1, so their bars must land in
 # baselines_rho-1.json -- the file stats.py opens for that group.
 DP_RHO=$(printf '%s\n' "${CELLS[@]}" | awk -F'|' '$1=="dr_poisson"{print $2; exit}')
@@ -149,17 +164,25 @@ DP_RHO=$(printf '%s\n' "${CELLS[@]}" | awk -F'|' '$1=="dr_poisson"{print $2; exi
 echo "== stage 3: training ($N_JOBS jobs, $WORKERS workers) =="
 JOBFILE=$(mktemp)
 for cell in "${CELLS[@]}"; do
-  IFS='|' read -r f r c t b cl <<<"$cell"; check_supported "$f" "$r" "$c" "$t"
+  IFS='|' read -r f r c t b cl bh <<<"$cell"; check_supported "$f" "$r" "$c" "$t"
   ms=$(scale_for "$f" "$r" "$c")
   EXTRA=""
-  [[ "$cl" != "-" ]] && EXTRA="obs_order_clip=$cl"
-  [[ "$f" == "dr_poisson" ]] && EXTRA="$EXTRA dr_lambda_lo=$DR_LO dr_lambda_hi=$DR_HI"
+  if [[ "$cl" != "-" ]]; then EXTRA="obs_order_clip=$cl"; fi
+  if [[ "$f" == "dr_poisson" ]]; then EXTRA="$EXTRA dr_lambda_lo=$DR_LO dr_lambda_hi=$DR_HI"; fi
+  # F3: b/h ratio -> hold h fixed at 0.5 and scale b, so the holding scale (and thus
+  # the S-grid's meaning) is unchanged and only the asymmetry moves.
+  if [[ "$bh" != "-" ]]; then EXTRA="$EXTRA holding_cost=0.5 backorder_cost=$(python3 -c "print(0.5*$bh)")"; fi
+  # F1: unconverged control at low rho -> longer, EQUAL budget for both arms there
+  EPS_CELL="$EPISODES"
+  if [[ "$f" == "ar1" && "$r" != "0.9" && -n "${LOW_RHO_EPISODES:-}" ]]; then
+    EPS_CELL="$LOW_RHO_EPISODES"
+  fi
   for ((k=0; k<N_SEEDS; k++)); do
-    s=$((SEED_START + k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl")
+    s=$((SEED_START + k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
     if [[ -f "runs/$tag/ckpt_best.pt" ]] && grep -q "\[signal\] done\." "runs/logs/$tag.log" 2>/dev/null; then
       continue; fi
     echo "$PY -m signal_lab.train --set tag=$tag content=$c seed=$s rho=$r beta=$b" \
-         "topology=$t msg_scale=$ms total_episodes=$EPISODES demand_family=$f $EXTRA" \
+         "topology=$t msg_scale=$ms total_episodes=$EPS_CELL demand_family=$f $EXTRA" \
          "> runs/logs/$tag.log 2>&1" >>"$JOBFILE"
   done
 done
@@ -167,15 +190,15 @@ echo "   pending: $(wc -l <"$JOBFILE") of $N_JOBS"
 xargs -a "$JOBFILE" -d'\n' -P "$WORKERS" -I{} bash -c '{}'
 rm -f "$JOBFILE"
 FAILED=0
-for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl <<<"$cell"
-  for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl")
+for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
+  for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
     grep -q "\[signal\] done\." "runs/logs/$tag.log" 2>/dev/null || { echo "   FAILED: $tag"; FAILED=1; }
   done; done
 [[ $FAILED -eq 0 ]] || { echo "FAIL-CLOSED: training failures above -- fix, re-run (idempotent)."; exit 3; }
 
 echo "== stage 4: evaluation =="
-for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl <<<"$cell"
-  for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl")
+for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
+  for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
     [[ -f "runs/$tag/eval/seed10000_rho${r}.json" ]] || \
       $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 --rho "$r" >>"runs/logs/$tag.log" 2>&1
     if [[ "$c" != "nocomm" ]]; then for iv in zeroed shuffled; do
@@ -190,12 +213,12 @@ echo "== stage 4b: ZERO-SHOT OOD transfer (nocomm vs raw, ar1 rho=.9 policies) =
 # decks. Training on those decks would be confounded (fixed calendar, memorisable);
 # transferring to them is not -- the schedule is unanticipated, so the retailer's
 # observation is a genuine early warning. Labels keep dumps disjoint.
-for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl <<<"$cell"
+for cell in "${CELLS[@]}"; do IFS='|' read -r f r c t b cl bh <<<"$cell"
   [[ "$f" == "ar1" && "$r" == "0.9" && "$cl" == "-" && "$t" == "retailer_broadcast" ]] || continue
   [[ "$c" == "nocomm" || "$c" == "raw" ]] || continue
   for sc_pair in "black_swan:-3" "extreme_chaos:-4"; do
     sc="${sc_pair%%:*}"; lab="${sc_pair##*:}"
-    for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl")
+    for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
       [[ -f "runs/$tag/eval/seed10000_rho${lab}.json" ]] || \
         $PY -m signal_lab.evaluate --ckpt "runs/$tag/ckpt_best.pt" --episodes 50 \
             --scenario "$sc" --rho "$lab" >>"runs/logs/$tag.log" 2>&1
@@ -217,12 +240,12 @@ echo "   OOD transfer complete."
 
 echo "== stage 5: analysis per (family,rho,beta) =="
 # analysis groups: (family, rho, beta, clip) -- clip arms pair within their own level
-for key in $(printf '%s\n' "${CELLS[@]}" | awk -F'|' '{print $1"|"$2"|"$5"|"$6}' | sort -u); do
-  IFS='|' read -r f r b klip <<<"$key"
+for key in $(printf '%s\n' "${CELLS[@]}" | awk -F'|' '{print $1"|"$2"|"$5"|"$6"|"$7}' | sort -u); do
+  IFS='|' read -r f r b klip kbh <<<"$key"
   noc=""; arms=""
-  for cell in "${CELLS[@]}"; do IFS='|' read -r f2 r2 c t b2 cl <<<"$cell"
-    [[ "$f2|$r2|$b2|$cl" == "$f|$r|$b|$klip" ]] || continue
-    for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl")
+  for cell in "${CELLS[@]}"; do IFS='|' read -r f2 r2 c t b2 cl bh <<<"$cell"
+    [[ "$f2|$r2|$b2|$cl|$bh" == "$f|$r|$b|$klip|$kbh" ]] || continue
+    for ((k=0; k<N_SEEDS; k++)); do s=$((SEED_START+k)); tag=$(tag_of "$f" "$r" "$c" "$t" "$b" "$s" "$cl" "$bh")
       if [[ "$c" == "nocomm" ]]; then noc+="$tag,"; else arms+="$tag,"; fi
     done; done
   [[ -n "$arms" ]] || continue
@@ -231,6 +254,7 @@ for key in $(printf '%s\n' "${CELLS[@]}" | awk -F'|' '{print $1"|"$2"|"$5"|"$6}'
   # first stats call. That exact failure shipped once; keep the explicit if.
   GLABEL="${f}_b${b//./}"
   if [[ "$klip" != "-" ]]; then GLABEL="${GLABEL}_cl${klip}"; fi
+  if [[ "$kbh" != "-" ]]; then GLABEL="${GLABEL}_bh${kbh}"; fi
   $PY -m signal_lab.stats --nocomm "${noc%,}" --arms "${arms%,}" --rho "$r" \
       --tag "$GLABEL" | tee "runs/stats_${f}_rho${r}_${GLABEL}.txt"
 done

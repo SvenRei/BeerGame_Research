@@ -404,6 +404,35 @@ def t_ood():
     print("T-OOD     stress decks shift regime; OOD eval swaps demand only OK")
 
 
+def t_costs():
+    """F3: the cost regime must reach the env from BOTH the training and the eval
+    construction path (the whitelist trap that once ate obs_order_clip), and must
+    actually change costs while leaving the physics identical."""
+    from env.beer_game import BeerGame
+    from signal_lab.train import load_config, make_env
+    cfg = load_config(os.path.join(ROOT, "conf", "signal.yaml"),
+                      ["holding_cost=0.5", "backorder_cost=2.0"])
+    env = make_env(cfg)
+    assert (env.h, env.b) == (0.5, 2.0), (env.h, env.b)
+    # physics invariance: same actions -> same inventory/backlog trajectory, only the
+    # COST scalars differ between regimes
+    rng = np.random.default_rng(3)
+    acts = [rng.integers(0, 40, 4) for _ in range(40)]
+    def roll(h, b):
+        e = BeerGame({"holding_cost": h, "backorder_cost": b, "ar1_rho": 0.9})
+        o = e.reset(seed=21); O, C = [o.copy()], []
+        for a in acts:
+            o, c, d, _ = e.step(a); O.append(o.copy()); C.append(c.copy())
+            if d: break
+        return np.array(O), np.array(C)
+    O1, C1 = roll(0.5, 1.0); O2, C2 = roll(0.5, 2.0)
+    np.testing.assert_array_equal(O1, O2)              # transitions untouched
+    assert not np.allclose(C1, C2), "cost regime had no effect on costs"
+    # backorder-heavy must cost MORE whenever any backlog exists
+    assert C2.sum() > C1.sum(), (C1.sum(), C2.sum())
+    print("T-COSTS   cost regime reaches env, physics invariant, costs shift OK")
+
+
 def t_smoke():
     tag = "_smoke_nocomm_s60"
     run = os.path.join(ROOT, "runs", tag)
@@ -462,6 +491,6 @@ def t_sweep():
 
 if __name__ == "__main__":
     t_env(); t_arpred(); t_interv(); t_frozen(); t_param(); t_sym(); t_grad()
-    t_stats(); t_dp(); t_p2(); t_geo(); t_lag(); t_ood(); t_smoke(); t_sweep()
+    t_stats(); t_dp(); t_p2(); t_geo(); t_lag(); t_ood(); t_costs(); t_smoke(); t_sweep()
     print("\nALL TESTS PASS -- the arm-symmetry, gradient-isolation, and fail-closed "
           "contracts hold.")

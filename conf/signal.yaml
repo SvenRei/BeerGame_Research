@@ -16,6 +16,8 @@ forecaster_path: "assets/forecaster_ar1r9.pt"   # required only for content=dhat
 demand_family: ar1      # ar1 | poisson | dr_poisson (dr: lambda ~ U[lo,hi] per episode)
 dr_lambda_lo: 4.0       # dr_poisson only
 dr_lambda_hi: 24.0      # dr_poisson only
+holding_cost: 0.5       # F3 robustness axis: cost regime. b/h = 2.0 is the
+backorder_cost: 1.0     #   registered default; b/h = 4.0 is the robustness cell.
 obs_order_clip: null    # P2 garbling: non-retailers observe min(order, c); null = off.
 #                         Passed through to the VENDORED env's own obs clip -- physics
 #                         (transitions, costs) are untouched; only the observation map.

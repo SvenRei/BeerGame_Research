@@ -131,6 +131,27 @@ def h2_slope(v_by_rho, alpha=0.05):
             "reject_null": bool(p < alpha and slopes.mean() > 0)}
 
 
+def study_wide_holm(pvals, alpha=0.05):
+    """F2: multiplicity across the STUDY, not just within families.
+
+    The paper makes ~13 primary hypothesis-level verdicts. Holm within a family does
+    not control the family-wise error rate across them. This applies Holm to the
+    primary set and reports which verdicts survive, so a referee does not have to
+    ask. Results with p ~ 1e-8 survive trivially; borderline ones (H-SHOCK at .03)
+    are expected NOT to, and should be carried by mechanism evidence instead.
+
+    pvals: {name: one-sided p}. Returns {name: (p, holm_p, survives)}.
+    """
+    items = sorted(pvals.items(), key=lambda kv: kv[1])
+    m = len(items)
+    out, running = {}, 0.0
+    for rank, (name, p) in enumerate(items):
+        running = max(running, min(1.0, (m - rank) * p))
+        out[name] = {"p": float(p), "holm_p": float(running),
+                     "survives": bool(running < alpha)}
+    return out
+
+
 def hrep_tost(fam_vectors, nocomm_cost_mean, frac=0.02, alpha=0.05):
     """Pairwise TOST between families at +/- frac*nocomm; Holm over the pairs."""
     names = sorted(fam_vectors)
@@ -204,6 +225,12 @@ def self_test():
     verdict = {(p["a"], p["b"]): p["equivalent"] for p in rep["pairs"]}
     assert verdict[("eps", "raw")] is True, rep
     assert verdict[("far", "raw")] is False and verdict[("eps", "far")] is False, rep
+    # study-wide Holm: strong results survive, borderline ones do not
+    sw = study_wide_holm({"strong": 1e-9, "mid": 1e-4, "borderline": 0.030,
+                          "weak": 0.40}, alpha=0.05)
+    assert sw["strong"]["survives"] and sw["mid"]["survives"], sw
+    assert not sw["borderline"]["survives"], sw          # .030 * 2 = .060 > .05
+    assert not sw["weak"]["survives"], sw
     # bootstrap-t bound sanity: below the SAMPLE mean, and its one-sided coverage of
     # the true mean is ~95% over repetitions
     x = rng.normal(100, 30, 20)

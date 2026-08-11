@@ -67,7 +67,9 @@ def evaluate(ckpt_path, episodes=50, rho=None, intervention="honest",
     if intervention != "honest":
         provider = InterventionWrapper(provider, intervention, seed=seed_base)
     rho = float(cfg["rho"] if rho is None else rho)
-    env = BeerGame({"dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
+    env = BeerGame({"holding_cost": cfg.get("holding_cost", 0.5),
+                    "backorder_cost": cfg.get("backorder_cost", 1.0),
+                    "dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
                     "dr_lambda_hi": cfg.get("dr_lambda_hi", 24.0),
                     "obs_order_clip": cfg.get("obs_order_clip", None),
                     "demand_family": scenario or cfg.get("demand_family", "ar1"),

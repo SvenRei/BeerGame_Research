@@ -41,7 +41,13 @@ from signal_lab.agent import Critic, SharedActor, orders_from_s  # noqa: E402
 from signal_lab.messages import MessageProvider  # noqa: E402
 
 GATE_RHOS = (0.15, 0.45, 0.75)      # selection regimes -- disjoint from deployment 0.9
-MONITOR_RHO = 0.9                   # logged, NEVER selects
+# R7-FIX: the selection monitor must score the cell in ITS OWN demand regime.
+# This was hardcoded to 0.9, so rho-grid cells (0, 0.3, 0.6) were selected on a regime
+# they neither trained nor were evaluated in. Symptom: nocomm-vs-StaticBS degraded
+# monotonically with |rho - 0.9| (-803 / -309 / +68 / -28) and seed CV rose to 0.34,
+# i.e. good low-rho checkpoints were trained and then discarded by the selector.
+# None -> use cfg["rho"]; the monitor SEED space (60000+) stays disjoint from eval.
+MONITOR_RHO = None
 GATE_SEED_BASE, MONITOR_SEED_BASE = 50_000, 60_000   # disjoint seed spaces
 
 
@@ -79,7 +85,12 @@ def make_env(cfg, rho=None):
                      # "garbled" arms on ungarbled observations.
                      "dr_lambda_lo": cfg.get("dr_lambda_lo", 4.0),
                      "dr_lambda_hi": cfg.get("dr_lambda_hi", 24.0),
-                     "obs_order_clip": cfg.get("obs_order_clip", None)})
+                     "obs_order_clip": cfg.get("obs_order_clip", None),
+                     # F3 cost regime -- same whitelist trap as the P1/P2 keys: the
+                     # vendored env supports these, but nothing passed them, so a
+                     # "b/h=4" cell would have trained at the default 2.0.
+                     "holding_cost": cfg.get("holding_cost", 0.5),
+                     "backorder_cost": cfg.get("backorder_cost", 1.0)})
 
 
 def make_provider(cfg, device="cpu"):
@@ -319,7 +330,8 @@ def main(argv=None):
         if ep % int(cfg["gate_every"]) == 0:
             g = gate_eval(actor, provider, cfg, GATE_RHOS, GATE_SEED_BASE,
                           int(cfg["gate_episodes_per_rho"]))
-            mon = gate_eval(actor, provider, cfg, (MONITOR_RHO,), MONITOR_SEED_BASE,
+            mon_rho = float(cfg["rho"]) if MONITOR_RHO is None else MONITOR_RHO
+            mon = gate_eval(actor, provider, cfg, (mon_rho,), MONITOR_SEED_BASE,
                             int(cfg["gate_episodes_per_rho"]))
             mark = ""
             # R7: selection criterion is configurable. `monitor` selects on held-out
@@ -344,7 +356,8 @@ def main(argv=None):
                           "state_absmean": f"{last_stats.get('state_absmean', float('nan')):.2f}"})
             for f in (ftr, fga, fup):
                 f.flush()
-            _mlab = ("DP" if cfg.get("demand_family") == "dr_poisson" else "0.9")
+            _mlab = ("DP" if cfg.get("demand_family") == "dr_poisson"
+                     else f"{mon_rho:g}")
             print(f"[signal] ep {ep:>6}  gate {g:8.1f}  monitor({_mlab}) {mon:8.1f}  "
                   f"EV {last_stats.get('honest_ev', float('nan')):+.4f}{mark}", flush=True)
         if milestones and ep == milestones[0]:

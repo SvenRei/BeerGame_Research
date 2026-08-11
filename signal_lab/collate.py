@@ -37,6 +37,7 @@ FIELDS = ["group", "regime", "rho_label", "arm", "family", "seed", "content",
           "bw_retailer", "bw_wholesaler", "bw_distributor", "bw_manufacturer",
           "ready_rate", "holding_share",
           "V_vs_nocomm", "V_se", "cohen_dz", "V_ci_lo", "V_ci_hi", "holm_p",
+          "V_robust", "cvar_reduction", "tail_mean_ratio",
           "paired_against",
           "V_vs_static", "V_vs_static_p", "gap_recovered", "gap_ci_lo", "gap_ci_hi",
           "listen_zeroed", "listen_shuffled", "fragility_excess",
@@ -87,6 +88,15 @@ def rows_from(path):
             "V_ci_lo": round(ci[0], 1) if ci[0] != "" else "",
             "V_ci_hi": round(ci[1], 1) if ci[1] != "" else "",
             "holm_p": f"{pb['holm_p']:.2e}" if pb.get("holm_p") is not None else "",
+            # F-review: V_robust = min(V vs nocomm, V vs Static). The two references
+            # inflate in OPPOSITE directions -- nocomm when it is undertrained,
+            # Static when it is too weak a bar -- so the minimum is defensible in
+            # every regime. Reported alongside, never instead of, both bars.
+            "V_robust": (round(min(pb["V_mean"],
+                                   _g(vb, "vs_static", "V_mean", default=1e18)), 1)
+                         if pb and vb.get("available") else
+                         (round(pb["V_mean"], 1) if pb else "")),
+            "cvar_reduction": "", "tail_mean_ratio": "",
             "paired_against": pb.get("paired_against", ""),
             "V_vs_static": round(_g(vb, "vs_static", "V_mean", default=float("nan")), 1)
                            if vb.get("available") else "",
@@ -128,6 +138,27 @@ def main():
         raise SystemExit(f"[collate] FAIL-CLOSED: no stats files match {a.stats}")
 
     rows, aggs = [], []
+
+    def _fill_tail(rs):
+        """F5: CVaR reduction vs the arm's OWN matched nocomm, per group+seed.
+        Sharing's tail benefit ran ~1.6x its mean benefit in the campaign; that is a
+        primary operations result and belongs in the sheet, not in a side script."""
+        idx = {(r["group"], r["seed"]): r for r in rs
+               if "nocomm" in r["family"] and r["cvar"] != ""}
+        for r in rs:
+            ref = idx.get((r["group"], r["seed"]))
+            if ref is None or r["cvar"] == "" or "nocomm" in r["family"]:
+                continue
+            try:
+                red = float(ref["cvar"]) - float(r["cvar"])
+                r["cvar_reduction"] = round(red, 1)
+                v = r["V_vs_nocomm"]
+                r["tail_mean_ratio"] = (round(red / float(v), 2)
+                                        if v not in ("", None) and float(v) > 1e-9
+                                        else "")
+            except (TypeError, ValueError):
+                pass
+
     for p in paths:
         try:
             r, g = rows_from(p)
@@ -136,6 +167,7 @@ def main():
         except Exception as e:                       # never silently skip
             print(f"[collate] WARNING: {os.path.basename(p)} unreadable: {e}")
 
+    _fill_tail(rows)
     csv_path = os.path.join(ROOT, a.out + ".csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")

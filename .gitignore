@@ -3,3 +3,4 @@ figs/
 __pycache__/
 *.pyc
 .venv/
+docs/REGISTRY_OUTCOMES.md
