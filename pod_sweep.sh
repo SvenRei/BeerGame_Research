@@ -74,6 +74,15 @@ for cl in 6 8; do for c in nocomm raw; do
 for t in upstream_only downstream_only manufacturer_broadcast no_neighbor all_to_all \
          neighbor_bidir wrong_partner skip full link_top_only link_bottom_only; do
   CELLS+=("ar1|0.9|raw|$t|1.0|-|-"); done
+# CONTENT x TOPOLOGY interaction. Every geometry cell above uses raw demand, so the
+# study can say broadcast beats relay FOR RAW but not whether the ranking of contents
+# survives a degraded channel. These three complete a 4x2 factorial -- {raw, forecast,
+# learned forecast, emergent} x {broadcast, relay} -- because the other five corners
+# already exist. Registered question: a forecast is a smoothed statistic, so it may
+# survive relaying better than a noisy raw observation; if the content gap widens under
+# relay, "what you send" starts to matter once the channel degrades.
+for c in arpred dhatc learned; do
+  CELLS+=("ar1|0.9|$c|upstream_only|1.0|-|-"); done
 # H-TIME: staleness gradient (raw itself is lag 0, reused from F_CONTENT)
 for c in raw_lag1 raw_lag2; do
   CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-|-"); done
