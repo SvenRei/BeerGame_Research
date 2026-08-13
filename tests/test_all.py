@@ -329,6 +329,42 @@ def t_geo():
     """Topology routing rows exact; no_neighbor delivers all-zero incoming."""
     from env.beer_game import BeerGame
     from signal_lab.messages import MessageProvider, routing_matrix
+    from signal_lab.messages import ADJ
+    for name, M in ADJ.items():
+        R = routing_matrix(name)
+        np.testing.assert_allclose(R, np.asarray(M, dtype=np.float32), atol=1e-6)
+        for i in range(4):                      # rows are a mean or are silent
+            s_ = R[i].sum()
+            assert abs(s_ - 1) < 1e-6 or s_ == 0, (name, i, s_)
+        assert np.trace(R) == 0, name           # nobody hears themselves
+    # averaging is real: a receiver with two senders gets their mean, not their sum
+    e = BeerGame({"ar1_rho": 0.9}); o = e.reset(seed=5)
+    p = MessageProvider("raw", "neighbor_bidir", 3, cfg={"ar1_mu": 12.0, "ar1_rho": 0.9})
+    p.incoming(e, o, learned_msgs=None)
+    o, _, _, _ = e.step(np.array([8, 12, 16, 20]))
+    inc = p.incoming(e, o, learned_msgs=None)
+    li = [float(e.last_incoming[k]) for k in
+          ("retailer", "wholesaler", "distributor", "manufacturer")]
+    np.testing.assert_allclose(inc[1, 0], 0.5 * (li[0] + li[2]), atol=1e-5)
+    np.testing.assert_allclose(inc[0, 0], li[1], atol=1e-5)
+    # the wrong-partner control is LIVE, unlike the empty channel it must not be confused with
+    q = MessageProvider("raw", "wrong_partner", 3, cfg={"ar1_mu": 12.0, "ar1_rho": 0.9})
+    q.incoming(e, o, learned_msgs=None)
+    assert np.abs(q.incoming(e, o, learned_msgs=None)).sum() > 0, "wrong_partner is silent"
+    assert routing_matrix("no_neighbor").sum() == 0, "no_neighbor must stay the EMPTY matrix"
+    A = routing_matrix("all_to_all")
+    assert A.sum() == 12 and np.trace(A) == 0, A          # everyone but self
+    assert (A + np.eye(4) == 1).all(), A
+    e = BeerGame({"ar1_rho": 0.9}); o = e.reset(seed=7)
+    p = MessageProvider("raw", "all_to_all", 3, cfg={"ar1_mu": 12.0, "ar1_rho": 0.9})
+    p.incoming(e, o, learned_msgs=None)
+    o, _, _, _ = e.step(np.array([9, 11, 13, 15]))
+    inc = p.incoming(e, o, learned_msgs=None)
+    li = [float(e.last_incoming[k]) for k in
+          ("retailer", "wholesaler", "distributor", "manufacturer")]
+    for i in range(4):
+        others = [li[j] for j in range(4) if j != i]
+        np.testing.assert_allclose(inc[i], others, atol=1e-6)   # per-sender, no sum
     R = routing_matrix("upstream_only")
     np.testing.assert_array_equal(R, routing_matrix("neighbor"))
     D = routing_matrix("downstream_only")

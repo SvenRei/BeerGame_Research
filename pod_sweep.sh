@@ -62,7 +62,17 @@ for cl in 6 8; do for c in nocomm raw; do
 # F_CONTENT). upstream_only is the RELAYED arm -- H-SOURCE contrasts the two. The rest
 # are placebos: downstream_only echoes each agent's own past order back at it, and
 # no_neighbor wires nobody to anybody (bit-identical to nocomm; V must be EXACTLY 0).
-for t in upstream_only downstream_only manufacturer_broadcast no_neighbor; do
+# all_to_all is the information CEILING for the channel -- every stage hears every
+# other -- and the benchmark retailer_broadcast must be measured against. It was absent
+# from the original geometry family, which registered "who hears the retailer" rather
+# than "how much connectivity"; without it the study has an upper bound it never tested.
+# Geometry family, complete. Beyond direction and source, these probe DENSITY
+# (all_to_all, full, skip), MIXING (neighbor_bidir: does a harmful channel degrade a
+# helpful one when both are live?), REACH (the two single-link probes: is the value at
+# the cleanest link or the most distorted one?) and a wrong-partner control that is
+# live rather than empty.
+for t in upstream_only downstream_only manufacturer_broadcast no_neighbor all_to_all \
+         neighbor_bidir wrong_partner skip full link_top_only link_bottom_only; do
   CELLS+=("ar1|0.9|raw|$t|1.0|-|-"); done
 # H-TIME: staleness gradient (raw itself is lag 0, reused from F_CONTENT)
 for c in raw_lag1 raw_lag2; do
@@ -95,7 +105,7 @@ if [[ "${H2_RERUN:-0}" == "1" ]]; then
 fi
 
 SUPPORTED_CONTENT="nocomm raw arpred dhatc ip learned raw_lag1 raw_lag2"
-SUPPORTED_TOPO="retailer_broadcast neighbor upstream_only downstream_only manufacturer_broadcast no_neighbor"
+SUPPORTED_TOPO="retailer_broadcast neighbor upstream_only downstream_only manufacturer_broadcast no_neighbor all_to_all neighbor_bidir wrong_partner skip full link_top_only link_bottom_only"
 SUPPORTED_FAMILY="ar1 poisson dr_poisson"
 
 tag_of() { local f=$1 r=$2 c=$3 t=$4 b=$5 s=$6 cl=$7 bh=${8:--}

@@ -32,7 +32,51 @@ from env.beer_game import AGENTS, N_AGENTS, BeerGame
 CONTENTS = ("nocomm", "raw", "ip", "arpred", "dhatc", "learned",
             "raw_lag1", "raw_lag2")
 TOPOLOGIES = ("retailer_broadcast", "neighbor", "upstream_only", "downstream_only",
-              "manufacturer_broadcast", "no_neighbor")
+              "manufacturer_broadcast", "no_neighbor", "all_to_all",
+              "neighbor_bidir", "wrong_partner", "skip", "full",
+              "link_top_only", "link_bottom_only")
+
+# Row-normalised adjacency: a receiver with several senders gets their AVERAGE, so the
+# magnitude entering the network does not scale with how many partners are connected.
+# Single-sender rows are identical under either convention, which is why every topology
+# the confirmatory campaign ran is unaffected by this addition.
+#
+# NAMING, deliberately conservative: `no_neighbor` and `neighbor` keep the meanings the
+# campaign ran (empty matrix; alias for upstream_only) because 15 seeds of results are
+# keyed to them. The wrong-partner control and the bidirectional neighbour therefore
+# enter under NEW names rather than redefining old ones.
+ADJ = {
+    # each stage hears BOTH neighbours, averaged -- does a harmful channel
+    # (downstream) degrade a helpful one (upstream) when both are present?
+    "neighbor_bidir": [[0.0, 1.0, 0.0, 0.0],
+                       [0.5, 0.0, 0.5, 0.0],
+                       [0.0, 0.5, 0.0, 0.5],
+                       [0.0, 0.0, 1.0, 0.0]],
+    # wrong-partner control: every stage hears only NON-adjacent stages. Live channel,
+    # real numbers, mismatched partners. If value came from communication as such
+    # rather than from the serial demand path, this would help.
+    "wrong_partner": [[0.0, 0.0, 0.5, 0.5],
+                      [0.0, 0.0, 0.0, 1.0],
+                      [1.0, 0.0, 0.0, 0.0],
+                      [0.5, 0.5, 0.0, 0.0]],
+    # full connectivity minus the retailer-manufacturer edge: everything except the
+    # skip-level link, isolating what that single long edge is worth.
+    "skip": [[0.0, 0.5, 0.5, 0.0],
+             [1/3., 0.0, 1/3., 1/3.],
+             [1/3., 1/3., 0.0, 1/3.],
+             [0.0, 0.5, 0.5, 0.0]],
+    # every stage hears every other, averaged into one slot. Compare against
+    # `all_to_all`, which routes the same edges into one slot PER SENDER: the pair
+    # measures what averaging co-senders costs.
+    "full": [[0.0, 1/3., 1/3., 1/3.],
+             [1/3., 0.0, 1/3., 1/3.],
+             [1/3., 1/3., 0.0, 1/3.],
+             [1/3., 1/3., 1/3., 0.0]],
+    # single-link probes: does the value sit at the cleanest link (one hop from demand)
+    # or the most distorted one (deepest in the chain)?
+    "link_top_only": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 1, 0]],
+    "link_bottom_only": [[0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+}
 INTERVENTIONS = ("honest", "zeroed", "shuffled", "cross")
 
 
@@ -55,6 +99,18 @@ def routing_matrix(topology):
     elif topology == "manufacturer_broadcast":
         # placebo: everyone hears the manufacturer, the agent FARTHEST from demand.
         R[0:N_AGENTS - 1, N_AGENTS - 1] = 1.0
+    elif topology in ADJ:
+        R[:] = np.asarray(ADJ[topology], dtype=np.float32)
+    elif topology == "all_to_all":
+        # Full transparency: every stage hears every other stage. This is the
+        # information ceiling for the channel -- the closest thing here to centralised
+        # planning -- and the benchmark retailer_broadcast should be measured against.
+        # NOTE the routing matmul SUMS co-senders into slot 0, which would conflate
+        # three distinct signals into one number. incoming() therefore gives this
+        # topology one slot PER SENDER (msg_dim 3 == the 3 other stages, exactly), so
+        # no information is lost and the architecture is unchanged.
+        R[:] = 1.0
+        np.fill_diagonal(R, 0.0)
     elif topology == "no_neighbor":
         # structural placebo: the channel machinery runs, nobody is wired to anybody.
         # With any content this is behaviourally identical to nocomm (all-zero
@@ -97,6 +153,7 @@ class MessageProvider:
             raise ValueError(f"unknown content {content!r} (choose from {CONTENTS})")
         self.content = content
         self.M = int(msg_dim)
+        self.topology = topology
         self.R = routing_matrix(topology)
         self.cfg = dict(cfg or {})
         self.family = str(self.cfg.get("demand_family", "ar1"))
@@ -192,7 +249,15 @@ class MessageProvider:
         else:
             m = np.zeros((N_AGENTS, self.M), dtype=np.float32)
             m[:, 0] = self._sender_values(env, obs)         # scalar in slot 0, zero-pad
-            out = self.R @ m
+            if self.topology == "all_to_all":
+                # one slot per sender, in stage order, skipping self
+                out = np.zeros((N_AGENTS, self.M), dtype=np.float32)
+                for i in range(N_AGENTS):
+                    others = [j for j in range(N_AGENTS) if j != i]
+                    for k, j in enumerate(others[:self.M]):
+                        out[i, k] = m[j, 0]
+            else:
+                out = self.R @ m
         self._seen_step = True
         return out
 
