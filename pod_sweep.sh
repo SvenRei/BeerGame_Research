@@ -106,6 +106,21 @@ for c in nocomm raw; do CELLS+=("ar1|0.9|$c|retailer_broadcast|1.0|-|4"); done
 # 24000 episodes -- ONLY the selector changes -- so this is a re-selection, not a
 # budget deviation. Tagged _v2 so the original cells stay on disk for before/after.
 # Enable with:  H2_RERUN=1 ./pod_sweep.sh run
+# GEO_ONLY=1: the geometry + content-x-topology questions ONLY, plus the two reference
+# cells they are measured against. Use when the previous campaign's checkpoints are not
+# available on this machine: retraining nocomm and raw-broadcast here costs 30 jobs and
+# makes every new comparison internally consistent, which is preferable to pairing new
+# cells against arms trained on a different machine with different measured divisors.
+if [[ "${GEO_ONLY:-0}" == "1" ]]; then
+  CELLS=("ar1|0.9|nocomm|retailer_broadcast|1.0|-|-"
+         "ar1|0.9|raw|retailer_broadcast|1.0|-|-")
+  for t in upstream_only downstream_only manufacturer_broadcast no_neighbor all_to_all \
+           neighbor_bidir wrong_partner skip full link_top_only link_bottom_only; do
+    CELLS+=("ar1|0.9|raw|$t|1.0|-|-"); done
+  for c in arpred dhatc learned; do
+    CELLS+=("ar1|0.9|$c|upstream_only|1.0|-|-"); done
+fi
+
 if [[ "${H2_RERUN:-0}" == "1" ]]; then
   CELLS=()
   for r in 0 0.3 0.6; do for c in nocomm raw dhatc; do
