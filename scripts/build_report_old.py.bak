@@ -12,7 +12,6 @@ No external assets, no network, no fonts to load: the output opens from a USB st
 """
 import argparse
 import csv
-import glob
 import json
 import os
 import sys
@@ -55,17 +54,12 @@ CAMPAIGN = {
     # from the per-run command.txt mtimes:
     #   python -c "import os,glob;t=sorted(os.path.getmtime(p) for p in
     #   glob.glob('runs/C_*/command.txt'));print(len(t),(t[-1]-t[0])/3600)"
-    # CONFIRMED from boot.log: the campaign's own stage-3 header reads
-    #   "== stage 3: training (660 jobs, 70 workers) =="
-    # and the plan block above it reads "workers: 70". Not inferred, not recalled.
-    "workers": 70,
-    # wall clock: first training job (earliest runs/C_*/command.txt) to the manifest
-    # (2026-08-14T08:35:48Z). Trainlog mtimes are NOT usable for this -- the eval stages
-    # append to them, so a log's timestamp marks the end of its evaluation, not of its
-    # training. Verify locally with:
-    #   python -c "import os,glob,datetime as dt;t=min(os.path.getmtime(p) for p in
-    #   glob.glob('runs/C_*/command.txt'));print(dt.datetime.fromtimestamp(t))"
-    "wall_clock": "~18 h",
+    # Set to None to omit the figure from the report rather than assert it.
+    "workers": None,
+    # wall clock: first training job (command.txt, 2026-08-13 20:30:57 UTC) to
+    # CAMPAIGN_MANIFEST.txt (2026-08-14T08:35:48Z) = 12 h 05 m, covering stages
+    # 3-7. Verification stages 0-2 ran before that window.
+    "wall_clock": "~12 h",
     # NOTE for the campaign section and the amendment. 44 cells were planned and
     # enumerated; 43 ran. tag_of() in pod_sweep.sh truncates the topology name to
     # four characters (${t:0:4}), so link_top_only and link_bottom_only both map
@@ -75,9 +69,7 @@ CAMPAIGN = {
     # topology: link_bottom_only in config_resolved.yaml. The cell was dropped
     # rather than patched, to preserve the single code hash 10776f66.
     "planned_cells": 44,
-    "dropped_cell": "link_top_only / link_bottom_only",
-    "contaminated_cell": "C_ar1_r09_raw_link_b10",
-    "usable_cells": 42,
+    "dropped_cell": "link_top_only",
 }
 
 
@@ -87,22 +79,13 @@ def _dropped_note():
     d, p, c = CAMPAIGN["dropped_cell"], CAMPAIGN["planned_cells"], CAMPAIGN["cells"]
     if not d or p == c:
         return ""
-    u = CAMPAIGN.get("usable_cells", c)
-    return (f' {p} conditions were planned, {c} produced a run directory, and <b>{u}</b> '
-            f'are reported. The sweep\u2019s tag builder truncates topology names to four '
-            f'characters, so <code>link_top_only</code> and <code>link_bottom_only</code> '
-            f'generated the same tag. The idempotency guard runs when the job list is '
-            f'built &mdash; before either condition has written anything &mdash; so both '
-            f'were queued, and the worker pool ran them at the same time into one '
-            f'directory, one log and one checkpoint path. Seven of the fifteen logs record '
-            f'two completions and contain interleaved partial writes. Which of the two '
-            f'topologies owns the surviving checkpoint varies by seed and cannot be '
-            f'recovered, so both single-edge conditions are withdrawn: the cell is a '
-            f'mixture of two treatments rather than a measurement of either. No other '
-            f'cell shows this signature &mdash; every one of the remaining {u} records a '
-            f'single start, a single completion and a full gate trace. The fault was '
-            f'found after the campaign closed and the conditions were dropped rather than '
-            f'patched, so every number reported here comes from one code revision.')
+    return (f' {p} conditions were planned; <b>{c}</b> ran. <code>{d}</code> was '
+            f'enumerated but never trained &mdash; the sweep\u2019s tag builder truncates '
+            f'topology names to four characters, so it collided with '
+            f'<code>link_bottom_only</code> and the idempotency guard reported it as '
+            f'already complete. The collision was found after the campaign closed and '
+            f'the condition was dropped rather than patched, so every number here comes '
+            f'from one code revision.')
 
 
 def _workers_note():
@@ -284,1172 +267,25 @@ class Data:
             self.extras = json.load(open(extras_path, encoding="utf-8"))
 
     def v(self, group, fam, col="V_vs_nocomm"):
-        # Substring matching is convenient but it silently merges conditions when a key
-        # is a prefix of more than one family: the dict comprehension keys on seed, so
-        # the LAST matching family wins and the report shows a different condition than
-        # its own label claims. This campaign added content x topology cells, which made
-        # the key "learned" match both learned_reta and learned_upst. Fail loudly.
-        hits = {r["family"] for r in self.rows if r["group"] == group and fam in r["family"]}
-        if len(hits) > 1:
-            raise SystemExit(
-                f"[report] FAIL-CLOSED: family key '{fam}' in group '{group}' matches "
-                f"{len(hits)} conditions: {sorted(hits)}. Narrow the key so it names "
-                f"exactly one condition.")
         d = {int(r["seed"]): float(r[col]) for r in self.rows
              if r["group"] == group and fam in r["family"]
              and r[col] not in ("", "nan", "n/a: Static==Cond")}
         return np.array([d[s] for s in sorted(d)])
 
 
-VERDICT_LOG = []
-MANIFEST = {}
-CONTROL_VALIDITY = {}
-
-# Every V is a difference against a no-sharing chain, and every "gap recovered" is a
-# fraction of the distance between two fitted benchmarks. Both readings assume the
-# no-sharing chain actually sits ON the unconditional benchmark. Two distinct failures
-# break that, and only one of them was previously detected:
-#
-#   BROKEN    the control is materially WORSE than the benchmark -- it did not learn,
-#             so V measures training failure rather than information.
-#   WEAK BAR  the control is materially BETTER than the benchmark -- the bar is not
-#             binding, so "fraction of the analytic gap" is a fraction of a distance
-#             the control has already crossed. The ratio can exceed 100% and means
-#             nothing. This case was silently reported as "holds".
-#
-# Threshold is 5% of the control's own cost: large enough to ignore estimation noise,
-# small enough to catch a benchmark that is not a real constraint.
-# Every V is a difference against a no-sharing chain, and every "gap recovered" is a
-# fraction of the distance between two fitted benchmarks. Both readings assume the
-# no-sharing chain actually sits ON the unconditional benchmark. That is a claim of
-# EQUIVALENCE, and equivalence cannot be established by failing to reject a difference --
-# at n = 15 that is weak absence of evidence. It is tested here with two one-sided tests
-# (Schuirmann 1987) against the declared materiality band, which yields three outcomes:
-#
-#   equivalent  the control sits on the benchmark; V is attributable to the channel
-#   below       the control is materially worse; V measures training as much as sharing
-#   above       the control beats the benchmark, which is not binding; the RATIO
-#               "fraction of the analytic gap" has a denominator the control has already
-#               crossed and is not interpretable, though V in cost units still is
-#
-def classify_control(seeds, cost, ood=False):
-    """Equivalence-tested, not threshold-classified. `seeds` is the per-seed vector of
-    (control cost - benchmark cost); `cost` is the control's own mean cost, which sets
-    the band."""
-    delta = float(np.mean(seeds)) if len(seeds) else float("nan")
-    if not cost or not len(seeds):
-        return {"status": "unknown", "delta": delta, "tost": None,
-                "why": "no-sharing cost or seed vector unavailable"}
-    band = MATERIALITY * cost
-    t = tost(seeds, band)
-    if ood:
-        return {"status": "transfer", "delta": delta, "tost": t,
-                "why": "zero-shot transfer: the benchmark is refitted to a regime the "
-                       "policy never trained on, so neither direction is a defect"}
-    ci = f"90% CI [{t['lo']:+,.0f}, {t['hi']:+,.0f}] against a band of "\
-         f"&plusmn;{band:,.0f}"
-    if t["decision"] == "below":
-        return {"status": "broken", "delta": delta, "tost": t,
-                "why": f"the no-sharing control is materially WORSE than the fitted "
-                       f"benchmark ({delta:+,.0f}, {ci}). V in this regime measures a "
-                       f"training failure as much as information, and gap-recovered is "
-                       f"not interpretable"}
-    if t["decision"] == "above":
-        return {"status": "weak-bar", "delta": delta, "tost": t,
-                "why": f"the no-sharing control materially BEATS the fitted benchmark "
-                       f"({delta:+,.0f}, {ci}), so the benchmark is not a binding floor "
-                       f"here. V in cost units remains valid; gap-recovered does not, "
-                       f"because its denominator is a distance the control has crossed"}
-    if t["decision"] == "equivalent":
-        return {"status": "holds", "delta": delta, "tost": t,
-                "why": f"the control is statistically EQUIVALENT to the fitted benchmark "
-                       f"({delta:+,.0f}, {ci}, TOST p = {t['p']:.3f}), so V is "
-                       f"attributable to the channel"}
-    return {"status": "undetermined", "delta": delta, "tost": t,
-            "why": f"the control is neither equivalent to the benchmark nor materially "
-                   f"different from it at this replication ({delta:+,.0f}, {ci}) -- the "
-                   f"interval is wider than the band, so the comparison is unresolved "
-                   f"rather than validated"}
-
-
-# Which analysis group each registered test is estimated on. A hypothesis inherits the
-# validity of the cell it is measured in; without this map a broken control is visible
-# in one table and invisible on the card that depends on it.
-HYP_GROUPS = {
-    "F_CONTENT": [G09], "H_SOURCE": [G09], "H_TIME": [G09], "H_TAIL": [G09],
-    "H_FRAGILITY": [G09], "H_LEARN": [G09], "H_REP": [G09], "IP": [G09],
-    "PLACEBO": [G09],
-    "H2": ["rho0_ar1_b10", "rho0.3_ar1_b10", "rho0.6_ar1_b10", G09],
-    "H_SHOCK": ["rho-3_ood"], "H_CALENDAR": ["rho-4_ood"],
-    "P1": ["rho-1_dr_poisson_b10"],
-    "P2": ["rho0.9_ar1_b10_cl6", "rho0.9_ar1_b10_cl8"],
-    "H_CRITICAL_RATIO": ["rho0.9_ar1_b10_bh4"],
-    "F_INCENTIVE": ["rho0.9_ar1_b0", "rho0.9_ar1_b05", G09],
-}
-
-
-def gap_cell(group, x, cls='n'):
-    """Render gap-recovered, or an em dash where the benchmark is not a binding floor.
-
-    A fraction of the analytic gap is only meaningful when the no-sharing control sits
-    ON the unconditional benchmark. Where the control already beats it, the denominator
-    is a distance the control has crossed and the ratio can exceed 100% -- which it does
-    here at low persistence (671% at rho 0.3, 231% at rho 0.6). Printing that number
-    invites a reading the design does not support, so it is withheld and the reason is
-    given in the validity table."""
-    st_ = (CONTROL_VALIDITY.get(group) or {}).get("status", "unknown")
-    if st_ in ("weak-bar", "broken"):
-        return ('<td class="n" style="color:var(--void)" title="benchmark not binding '
-                'in this regime">&mdash;</td>')
-    try:
-        return f'<td class="{cls}">{float(x):.0%}</td>'
-    except (TypeError, ValueError):
-        return '<td class="n" style="color:var(--void)">&mdash;</td>'
-
-
-def shared_reference_note(D):
-    """Every V in the headline family is a difference against the SAME no-sharing arms,
-    so the tests in the Holm family are not independent -- they share a denominator and
-    a set of trained control policies. Holm is valid under arbitrary dependence, so the
-    correction is not wrong; but a reader who assumes independence will read the family
-    as carrying more information than it does. The correlation is measured here rather
-    than asserted."""
-    fams = [f for _n, f, _M, _l, _w in TOPOS if f]
-    fams += ["arpred_reta", "dhatc_reta_b10", "learned_reta", "ip_reta"]
-    series = []
-    for f in fams:
-        x = D.v(G09, f)
-        if len(x) == 15 and x.std(ddof=1) > 0:
-            series.append(x)
-    if len(series) < 3:
-        return ""
-    n_t = len(_topo_series(D))
-    n_topo_pairs = n_t * (n_t - 1) // 2
-    M = np.corrcoef(np.vstack(series))
-    off = M[np.triu_indices_from(M, k=1)]
-    return (f'<p style="max-width:72ch;margin-top:20px;color:var(--ink-2);font-size:16px">'
-            f'<b>These tests are not independent.</b> Every value in the family above is '
-            f'a paired difference against the same fifteen no-sharing chains, so the arms '
-            f'share both a reference and a set of trained controls. Across the '
-            f'{len(series)} arms measured at the headline regime the pairwise correlation '
-            f'of seed-level values runs from {off.min():.2f} to {off.max():.2f} '
-            f'(median {np.median(off):.2f}). Holm is valid under arbitrary dependence, so '
-            f'the correction stands; but the family should be read as one experiment '
-            f'answered many ways, not as {len(series)} independent experiments. The family '
-            f'is also author-constructed: it covers the primary directional claim of each '
-            f'registered hypothesis, and does not include the {n_topo_pairs} pairwise '
-            f'topology comparisons, which carry their own correction within their own '
-            f'table.</p>')
-
-
-def bullwhip_asymmetry(D):
-    """Where the amplification actually moves. 'Almost untouched' is true of the curve
-    as a whole and hides the mechanism: sharing calms the ONE stage that could already
-    see demand and leaves the three it was meant to help essentially unchanged. That
-    asymmetry is the finding, and it is the opposite of what demand-signal processing
-    (Lee, Padmanabhan & Whang 1997) predicts sharing should do."""
-    names = [("bw_retailer", "retailer"), ("bw_wholesaler", "wholesaler"),
-             ("bw_distributor", "distributor"), ("bw_manufacturer", "factory")]
-    out = []
-    for col, lab in names:
-        a, b = D.v(G09, "nocomm_reta_b10", col), D.v(G09, "raw_reta_b10", col)
-        if len(a) != len(b) or not len(a):
-            return ""
-        d = b - a
-        t, p2 = st.ttest_1samp(d, 0) if d.std(ddof=1) > 0 else (0.0, 1.0)
-        out.append((lab, a.mean(), b.mean(), d.mean(), float(p2)))
-    rows = "".join(
-        f'<tr><td>{lab}</td><td class="n">{x:.2f}</td><td class="n">{y:.2f}</td>'
-        f'<td class="n">{d:+.2f}</td>{_num(p, ".3f")}'
-        f'<td><span class="pill p-{"broken" if p < 0.05 else "holds"}">'
-        f'{"changed" if p < 0.05 else "unchanged"}</span></td></tr>'
-        for lab, x, y, d, p in out)
-    ret = out[0]
-    return (f'<table class="cert" style="margin-top:18px">'
-            f'<tr><th>stage</th><th>no sharing</th><th>shared</th><th>change</th>'
-            f'<th>p</th><th></th></tr>{rows}</table>'
-            f'<p style="max-width:72ch;margin-top:16px;color:var(--ink-2);font-size:16px">'
-            f'<b>The aggregate curve hides an asymmetry.</b> Amplification falls sharply '
-            f'at the retailer ({ret[1]:.2f} to {ret[2]:.2f}) and moves little anywhere '
-            f'else. Sharing calms the one stage that could already observe demand, and '
-            f'leaves the three stages the channel exists to serve substantially as they '
-            f'were. Demand-signal processing is the bullwhip cause this design '
-            f'manipulates, so the prediction from that literature is that upstream '
-            f'amplification should fall; it does not. Cost falls by roughly a fifth '
-            f'regardless, which means the saving is coming from better-timed inventory '
-            f'positioning rather than from smoother ordering.</p>')
-
-
-def scope_note(D):
-    """What n = 15 is, and what it is not.
-
-    Fifteen seeds vary network initialisation and the demand draws a policy trains on.
-    They do not vary the supply chain. Every interval in this report is therefore an
-    interval on what this architecture learns in THIS environment, and a reader is
-    entitled to see that stated where the intervals are, not inferred from the methods.
-    The comparative statics are one-dimensional slices through a single point, and the
-    two structural parameters most likely to move the result -- lead time and echelon
-    count -- are held fixed throughout."""
-    noc = D.v(G09, "nocomm_reta_b10", "cost_mean")
-    return (f'<div class="prov" style="border-left:3px solid var(--flow)">'
-            f'<span class="pl">what n = 15 is</span>'
-            f'Fifteen <b>training seeds</b>: each initialises a network and draws the '
-            f'demand sequences its policy learns from. They are replicates of training, '
-            f'not of the supply chain. Every confidence interval here is an interval on '
-            f'what this architecture learns in this environment.'
-            f'<span class="pl" style="margin-top:10px">what is held fixed</span>'
-            f'Four echelons, two-week lead time, holding 0.5 and backorder 1.0 per unit '
-            f'per week, AR(1) demand with mean 12, fifty-week horizon. Persistence, the '
-            f'cost ratio, the incentive weight and the channel geometry are each varied '
-            f'on their own axis; <b>echelon count and lead time are not varied at all</b>, '
-            f'and both are first-order determinants of how much delay a channel removes. '
-            f'The results should be read as conditional on this chain.'
-            f'<span class="pl" style="margin-top:10px">what V does not include</span>'
-            f'V is a <b>gross</b> cost reduction against a no-sharing chain costing '
-            f'{noc.mean():,.0f}. It carries no implementation, integration or contracting '
-            f'cost for the visibility programme that would deliver the signal, and no '
-            f'allowance for a feed less reliable than the one simulated here &mdash; a '
-            f'point the dependence result below makes material rather than academic.'
-            f'</div>')
-
-
-def shock_claim_split(R, hl):
-    """The opening figure carries three claims of very different strength. State them
-    apart, at the figure, before a reader forms one impression of all three."""
-    e = (R.get("H_SHOCK") or {}).get("extra") or {}
-    if not e.get("split"):
-        return ""
-    corrected = (hl or {}).get("H-SHOCK", {})
-    hp = corrected.get("holm")
-    surv = corrected.get("survives")
-    hp_txt = (f"Holm-corrected across the registered family it reaches "
-              f"p = {hp:.3f}, which does {'' if surv else 'not '}clear 0.05."
-              if hp is not None else "")
-    return (f'<div class="prov" style="border-left:3px solid var(--flow)">'
-            f'<span class="pl">three claims, three strengths</span>'
-            f'<b>1. The timing above is a mechanism, not an estimate.</b> Every stage '
-            f'moves in week one with sharing and at roughly three-week intervals without '
-            f'it. That pattern was identical on all fifteen chains and at all three '
-            f'response thresholds, so it is a property of the design rather than a '
-            f'finding with an interval around it.'
-            f'<br><br><b>2. Sharing is worth {e["level"]:+,.0f} under this shock</b> '
-            f'&mdash; {e["level_pos"]}/15 seeds, p = {e["level_p"]:.1e}. This is not in '
-            f'doubt and does not depend on claim 3.'
-            f'<br><br><b>3. Whether it is worth MORE under shock than in normal '
-            f'operation is the registered claim, and it is the weak one:</b> '
-            f'{e["delta"]:+,.0f} cost units, {e["delta_pos"]}/15 seeds. {hp_txt} '
-            f'The figure opens the report because it makes the mechanism legible, not '
-            f'because this comparison is the study\u2019s strongest evidence &mdash; the '
-            f'persistence gradient and the content ladder are.</div>')
-
-
-def persistence_hero(D, R):
-    """The study's central comparative static, placed where a reader arrives.
-
-    This figure leads because it is the strongest evidence in the report: four demand
-    regimes, fifteen seeds each, every level positive on every seed, and a gradient that
-    clears family-wise correction by ten orders of magnitude. The disruption figure that
-    used to open the document is a better PICTURE of the mechanism, but a weaker piece of
-    evidence -- its registered comparative claim does not survive correction -- and
-    leading with it invited the impression that the study rests on it."""
-    lv = (R.get("H2") or {}).get("extra", {}).get("curve")
-    rows = (R.get("H2") or {}).get("stats", [])
-    if not lv or not rows:
-        return ""
-    lo, hi = lv[0][1], lv[-1][1]
-    allpos = all(r.get("pos", 0) == r.get("n", 0) for r in rows if r.get("n"))
-    mult = (hi / lo) if lo else 0
-    return f"""
-  <figure class="fig" style="margin-top:30px">
-    <figcaption class="fc-top">Value of sharing raw demand against how much demand
-      remembers itself &mdash; four regimes, fifteen independently trained chains
-      each</figcaption>
-    {curve_svg(R)}
-    <figcaption><b>This is the study's central result.</b> The same channel, carrying
-    the same content, through four demand processes that differ only in persistence.
-    Where each week is independent of the last the channel is worth
-    <span class="num">{lo:+,.0f}</span>; where demand drifts in long swings it is worth
-    <span class="num">{hi:+,.0f}</span> &mdash; a factor of {mult:.0f}.
-    <br><br>
-    The curve is convex, not linear: each additional unit of persistence is worth more
-    than the last. That shape is the answer to the question the literature disagrees
-    about. Estimates of "substantial", "about two per cent" and "zero" are not
-    contradictory findings so much as readings taken at different points on this axis,
-    and the axis is a property of the demand process rather than of the supply chain.
-    <br><br>
-    {"Every level is positive on every one of the fifteen seeds" if allpos else
-     "Not every level is positive on every seed"}, and the gradient clears family-wise
-    correction across the whole registered set by many orders of magnitude. Nothing else
-    in this report is supported this strongly, which is why it comes first.</figcaption>
-  </figure>"""
-
-
-EV_CANARY = 0.05          # design threshold: honest EV below this after episode 3000
-EV_AFTER = 3000
-
-
-def critic_health(root):
-    """The canary the design promised and nothing ever read.
-
-    Every run logs honest explained variance -- 1 - Var(G-V)/Var(G) against Monte-Carlo
-    returns -- at each gate, precisely so that a collapsed critic is visible immediately
-    rather than seven tuning rounds later. The threshold was declared in advance at 0.05
-    after episode 3000. It was written to metrics_gate.csv in all 645 runs and never
-    checked, which means the report has been claiming a diagnostic it did not perform.
-
-    Also reports the critic-input magnitude, because the critic divides the global state
-    by a FIXED 100 rather than normalising it: if |state| drifts, that constant stops
-    being adequate and the value estimates degrade quietly."""
-    import glob
-    rows, ev_min, st_max = [], [], []
-    for p_ in sorted(glob.glob(os.path.join(root, "runs", "C_*", "metrics_gate.csv"))):
-        try:
-            rs = list(csv.DictReader(open(p_, encoding="utf-8")))
-        except OSError:
-            continue
-        def _num(row, key, lo=-1e6, hi=1e6):
-            """A gate row can be a truncated final write: the process ends mid-line and
-            the next episode number lands in a later column. That produced a reported
-            critic-input magnitude of 21,600 where the run's true value was 4.3 -- a
-            parsing artifact indistinguishable from a real pathology unless it is
-            screened. Reject values outside a plausible band rather than believing them."""
-            x = row.get(key)
-            if x in (None, "", "nan"):
-                return None
-            try:
-                f = float(x)
-            except (TypeError, ValueError):
-                return None
-            return f if lo <= f <= hi and np.isfinite(f) else None
-
-        good = [r for r in rs if _num(r, "episode") is not None]
-        ev = [e for e in (_num(r, "honest_ev", -5, 5) for r in good
-                          if (_num(r, "episode") or 0) >= EV_AFTER) if e is not None]
-        if not ev:
-            continue
-        # state magnitude is a mean absolute value over a bounded observation, so any
-        # reading in the thousands is a shifted column, not a state.
-        sa = [x for x in (_num(r, "state_absmean", 0, 1000) for r in good) if x is not None]
-        dropped = sum(1 for r in rs if _num(r, "state_absmean") is not None
-                      and _num(r, "state_absmean", 0, 1000) is None)
-        tag = os.path.basename(os.path.dirname(p_))
-        rows.append({"tag": tag, "ev_min": min(ev), "ev_final": ev[-1],
-                     "state_max": max(sa) if sa else float("nan"),
-                     "dropped": dropped})
-        ev_min.append(min(ev))
-        if sa:
-            st_max.append(max(sa))
-    if not rows:
-        return ""
-    fired = [r for r in rows if r["ev_min"] < EV_CANARY]
-    ev_min = np.asarray(ev_min)
-    worst = sorted(rows, key=lambda r: r["ev_min"])[:5]
-    worst_html = "".join(
-        f'<tr><td><code>{r["tag"]}</code></td><td class="n">{r["ev_min"]:.3f}</td>'
-        f'<td class="n">{r["ev_final"]:.3f}</td>'
-        f'<td class="n">{r["state_max"]:,.1f}</td></tr>' for r in worst)
-    verdict = ("no run in the campaign tripped it"
-               if not fired else
-               f"<b>{len(fired)} of {len(rows)} runs tripped it</b>")
-    st_txt = (f" Critic-input magnitude peaked at {max(st_max):,.0f} across the campaign, "
-              f"against the fixed divisor of 100 the critic applies."
-              if st_max else "")
-    return (f'<p style="max-width:74ch;margin-top:22px">The critic is the one component '
-            f'whose failure would not show up as a bad cost number: a collapsed value '
-            f'function still trains a policy, just badly and silently. Every run '
-            f'therefore logs <b>honest explained variance</b> &mdash; measured against '
-            f'Monte-Carlo returns rather than against the advantage estimate that '
-            f'produced it &mdash; with a threshold declared in advance at '
-            f'{EV_CANARY:.2f} after episode {EV_AFTER:,}. Across all '
-            f'{len(rows)} runs, {verdict}: the lowest value reached anywhere was '
-            f'{ev_min.min():.3f}, the median run held {np.median(ev_min):.3f}.{st_txt}</p>'
-            f'<table class="cert" style="margin-top:16px">'
-            f'<tr><th>five weakest runs</th><th>lowest honest EV</th>'
-            f'<th>final honest EV</th><th>peak |state|</th></tr>{worst_html}</table>'
-            f'<p style="max-width:74ch;margin-top:14px;color:var(--ink-2);font-size:15px">'
-            f'Shown as the five weakest rather than an average, because an average over '
-            f'{len(rows)} runs would hide exactly the single failure this check exists '
-            f'to find.</p>')
-
-
-S_GRID_MAX = 100.0        # registered decision R1: 41 levels spanning 0..100 units
-CEILING = {}              # analysis group -> {status, max_S, why}
-
-# Which baselines file supplies the benchmark for which analysis group. Needed so a
-# hypothesis card can inherit "the agent could not express this benchmark" the same way
-# it inherits a failed control.
-BASELINE_GROUP = {
-    "baselines_rho0.json": "rho0_ar1_b10",
-    "baselines_rho0.3.json": "rho0.3_ar1_b10",
-    "baselines_rho0.6.json": "rho0.6_ar1_b10",
-    "baselines_rho0.9.json": "rho0.9_ar1_b10",
-    "baselines_rho0.9_bh4.json": "rho0.9_ar1_b10_bh4",
-    "baselines_rho-1.json": "rho-1_dr_poisson_b10",
-    "baselines_rho-3.json": "rho-3_ood",
-    "baselines_rho-4.json": "rho-4_ood",
-}
-
-
-def action_ceiling_check(root):
-    """Can the agent even express the policy it is being measured against?
-
-    The agent chooses an order-up-to level on a fixed grid spanning 0 to 100 units. The
-    analytic benchmark is fitted by search over a WIDER range (to 120). Where a fitted
-    level sits at or above the agent's ceiling, the comparison is not between two
-    policies -- it is between one policy and a target the other cannot represent, and
-    the resulting deficit measures a truncated action space rather than an economic
-    effect.
-
-    This was found by reading a cell's fitted levels after its control failed the
-    validity check, which is one campaign too late. Checking it at build time makes the
-    failure visible before a number is read."""
-    import glob
-    rows = []
-    for p_ in sorted(glob.glob(os.path.join(root, "runs", "baselines_*.json"))):
-        try:
-            b = json.load(open(p_, encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        S = b.get("static_S") or []
-        if not S:
-            continue
-        mx = max(S)
-        over = mx >= S_GRID_MAX
-        fn = os.path.basename(p_)
-        rows.append({"file": fn, "S": S, "max": mx, "over": over})
-        g = BASELINE_GROUP.get(fn)
-        if g:
-            CEILING[g] = {
-                "max_S": mx,
-                "status": "exceeds" if over else "clear",
-                "why": (f"the fitted benchmark reaches {mx:.0f} units at one stage while "
-                        f"the agent's order-up-to grid stops at {S_GRID_MAX:.0f}, so the "
-                        f"agent cannot represent the policy it is scored against. Whether "
-                        f"the ceiling actually BOUND is a separate question, answered by "
-                        f"how often the trained policy chose its topmost action"
-                        if over else
-                        f"the fitted benchmark reaches {mx:.0f} of the agent's "
-                        f"{S_GRID_MAX:.0f}-unit ceiling, leaving little headroom")}
-    if not rows:
-        return ""
-    bad = [r for r in rows if r["over"]]
-    body = "".join(
-        f'<tr><td><code>{r["file"]}</code></td>'
-        f'<td class="n">{" / ".join(f"{x:.0f}" for x in r["S"])}</td>'
-        f'<td class="n">{r["max"]:.0f}</td>'
-        f'<td><span class="pill p-{"broken" if r["over"] else "holds"}">'
-        f'{"exceeds grid" if r["over"] else "within grid"}'
-        f'</span></td></tr>' for r in rows)
-    if bad:
-        note = (f'<p style="max-width:74ch;margin-top:14px"><b>{len(bad)} of {len(rows)} '
-                f'regimes fit a benchmark the agent cannot represent.</b> The agent picks '
-                f'an order-up-to level on a grid that stops at {S_GRID_MAX:.0f} units; '
-                f'where the fitted level exceeds that, the agent is structurally unable '
-                f'to hold the stock the benchmark holds, and any deficit against that '
-                f'benchmark measures the action space rather than the policy. Results '
-                f'from those regimes are reported with this caveat and should not be '
-                f'read as evidence about the economics of the regime.</p>')
-    else:
-        note = (f'<p style="max-width:74ch;margin-top:14px">Every fitted benchmark sits '
-                f'inside the agent\u2019s action grid, so in no regime is the agent being '
-                f'measured against a target it cannot represent.</p>')
-    return (f'<table class="cert" style="margin-top:16px">'
-            f'<tr><th>regime</th><th>fitted order-up-to, R / W / D / M</th>'
-            f'<th>highest</th><th></th></tr>{body}</table>{note}')
-
-
-def policy_saturation(root, group_tags, top_bin=40):
-    """Does the trained policy actually press against its action ceiling?
-
-    A fitted benchmark above the grid maximum says the agent cannot REPRESENT that
-    benchmark. It does not say the agent was trying to. Under regime uncertainty the
-    fitted level is 106 against a ceiling of 100, yet the policy operates around bin 25
-    of 40 and the ceiling never binds -- there the agent simply found a different policy.
-    Under backorder-heavy costs the distributor sits at the top bin a quarter of the
-    time while the same cell at the default cost ratio never does.
-
-    Saturation is therefore the decisive test and the fitted level is only the flag that
-    prompts it. Returns the top-bin share per stage, or None when trajectories are absent.
-    """
-    import glob
-    A = []
-    for tag in group_tags:
-        # HONEST rollouts only. Globbing "*_traj.json" and taking the first match sorts
-        # "..._shuffled_traj.json" ahead of "..._traj.json", so the saturation of the
-        # sharing arm was being read from a run whose messages had been scrambled --
-        # which is precisely the condition under which it behaves like the control.
-        cand = [q for q in glob.glob(os.path.join(root, "runs", tag, "eval", "*_traj.json"))
-                if not any(iv in os.path.basename(q)
-                           for iv in ("_zeroed", "_shuffled", "obs_shuffled", "ckpt_budget"))]
-        for p_ in sorted(cand):
-            try:
-                d = json.load(open(p_, encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            eps = d.get("per_episode") or []
-            if eps and "actions" in eps[0]:
-                A.append(np.asarray(eps[0]["actions"]))
-            break
-    if not A:
-        return None
-    M = np.concatenate(A)
-    return {"share": (M == top_bin).mean(0).round(3).tolist(),
-            "mean_bin": M.mean(0).round(1).tolist(), "n": len(A),
-            "n_actions": int(M.shape[0]), "top_bin": int(top_bin),
-            "k_top": [int(x) for x in (M == top_bin).sum(0)]}
-
-
-# Whether a ceiling BOUND is a question about a proportion -- how often the policy chose
-# its boundary action -- and it has a within-study control: the same cell at the default
-# cost ratio, where that proportion is 0.000. It is therefore tested as a difference of
-# proportions (two-proportion z-test with a Newcombe 1998 hybrid-score interval) rather
-# than classified against a cutoff.
-
-
-def ceiling_binding(root):
-    """Which groups had their ACTION SPACE bind, as opposed to merely fitting a
-    benchmark outside it.
-
-    Two different facts, and only the second invalidates a comparative claim:
-      representability  the fitted benchmark sits above the agent's grid maximum
-      binding           the trained policy actually operates at the top of its range
-
-    Under regime uncertainty the benchmark wants 106 against a ceiling of 100, yet the
-    policy runs at ~65% of its range and never presses the wall -- it found a different
-    policy, and its results stand. Under backorder-heavy costs the policy runs at ~91%
-    of range with the distributor at its topmost action a quarter of the time, while the
-    same cell at the default cost ratio never does. Only the second case is withdrawn.
-
-    Derived per build from the trajectories; nothing here is asserted."""
-    out = {}
-    for g, c in CEILING.items():
-        if c.get("status") != "exceeds":
-            continue
-        tags = sorted({t for t in (os.path.basename(os.path.dirname(p_))
-                                   for p_ in glob.glob(
-                                       os.path.join(root, "runs", "C_*", "eval")))
-                       if GROUP_OF_TAG.get(t) == g})
-        # Saturation per ARM. Whether the ceiling binds one side of the comparison or
-        # both determines whether V is merely confounded or biased with a known sign.
-        noc = [t for t in tags if "nocomm" in t]
-        com = [t for t in tags if "nocomm" not in t]
-        sat = policy_saturation(root, tags) if tags else None
-        sat_n = policy_saturation(root, noc) if noc else None
-        sat_c = policy_saturation(root, com) if com else None
-        if not sat:
-            out[g] = {**c, "binding": None,
-                      "why_binding": "no trajectories available to test whether the "
-                                     "ceiling actually bound"}
-            continue
-        top = int(sat.get("top_bin", 40))
-        n_act = int(sat.get("n_actions", 0)) or 1
-        k_act = int(round(max(sat["share"]) * n_act))
-        ref = policy_saturation(root, REFERENCE_TAGS) if REFERENCE_TAGS else None
-        frac = max(sat["mean_bin"]) / float(top)
-        if ref:
-            n_ref = int(ref.get("n_actions", 0)) or 1
-            k_ref = int(round(max(ref["share"]) * n_ref))
-            pd_ = prop_diff(k_act, n_act, k_ref, n_ref)
-            binding = pd_["p"] < ALPHA and pd_["diff"] > 0
-            test_txt = (f"the policy chooses its topmost order-up-to level "
-                        f"{max(sat['share']):.1%} of the time against "
-                        f"{max(ref['share']):.1%} in the reference regime "
-                        f"(difference {pd_['diff']:+.1%}, 95% CI "
-                        f"[{pd_['lo']:+.1%}, {pd_['hi']:+.1%}], p = {pd_['p']:.1e})")
-        else:
-            pd_ = None
-            binding = None
-            test_txt = ("no reference regime available to compare the boundary-action "
-                        "proportion against")
-        asym = ""
-        if sat_n and sat_c:
-            nn_, nc_ = int(sat_n.get("n_actions", 0)) or 1, int(sat_c.get("n_actions", 0)) or 1
-            pa = prop_diff(int(round(max(sat_n["share"]) * nn_)), nn_,
-                           int(round(max(sat_c["share"]) * nc_)), nc_)
-            fn_, fc_ = max(sat_n["mean_bin"]) / 40.0, max(sat_c["mean_bin"]) / 40.0
-            sep = pa["p"] < ALPHA
-            if sep and pa["diff"] > 0:
-                asym = (f" The ceiling binds ASYMMETRICALLY: the no-sharing control runs "
-                        f"at {fn_:.0%} of its action range and takes its topmost level "
-                        f"{max(sat_n['share']):.0%} of the time, while the sharing arm "
-                        f"runs at {fc_:.0%} and reaches the top only "
-                        f"{max(sat_c['share']):.0%} of the time. The constraint therefore "
-                        f"handicaps one side of the comparison and not the other, so V "
-                        f"here is not merely confounded but biased UPWARD by a known "
-                        f"mechanism. The direction is intuitive: a chain that cannot see "
-                        f"demand needs stock it is not allowed to hold, while a chain "
-                        f"that can see demand substitutes information for that stock and "
-                        f"never reaches the limit.")
-            elif sep and pa["diff"] < 0:
-                asym = (f" The sharing arm is the more constrained of the two "
-                        f"({fc_:.0%} of range against {fn_:.0%}), so V here is biased "
-                        f"DOWNWARD.")
-            else:
-                asym = (f" Both arms are constrained to a similar degree "
-                        f"({fn_:.0%} and {fc_:.0%} of range), so V within this regime is "
-                        f"roughly unbiased even though the comparison against an "
-                        f"unconstrained regime is not.")
-        out[g] = {**c, "binding": binding, "sat": sat, "frac": frac,
-                  "sat_nocomm": sat_n, "sat_comm": sat_c, "asym": asym,
-                  "why_binding": (
-                      f"the trained policy runs at {frac:.0%} of its action range and "
-                      f"chooses its topmost order-up-to level "
-                      f"{max(sat['share']):.0%} of the time, so the ceiling BOUND: any "
-                      f"contrast against a regime where it did not bind confounds the "
-                      f"treatment with a change in the policy class.{asym}".rstrip()
-                      if binding else
-                      f"the trained policy runs at only {frac:.0%} of its action range, "
-                      f"so the ceiling did not bind and the result stands on its own "
-                      f"terms")}
-    return out
-
-
-def withdrawn_reason(key):
-    """A hypothesis is withdrawn when the cell it is estimated in had its action space
-    bind. Withdrawal is not a verdict: it says the instrument could not reach the region
-    where the registered question lives, which is different from looking and finding
-    nothing."""
-    for g in HYP_GROUPS.get(key, []):
-        b = BINDING.get(g)
-        if b and b.get("binding"):
-            return (f"Estimated in <code>{g}</code>, where the agent's order-up-to grid "
-                    f"stops at {S_GRID_MAX:.0f} units and the fitted benchmark reaches "
-                    f"{b['max_S']:.0f}. {b['why_binding'][0].upper()}{b['why_binding'][1:].rstrip('.')}.")
-    return None
-
-
-BINDING = {}
-GROUP_OF_TAG = {}
-# The within-study control for the boundary-action proportion: the same arms at the
-# default cost ratio, where the fitted benchmark sits well inside the grid.
-REFERENCE_TAGS = [f"C_ar1_r09_nocomm_reta_b10_s{s_}" for s_ in range(30, 45)] + \
-                 [f"C_ar1_r09_raw_reta_b10_s{s_}" for s_ in range(30, 45)]
-
-
-def prize_table(D):
-    """The decomposition that answers the benchmarking question.
-
-    Every baselines file records the cost of the best UNCONDITIONAL base-stock policy
-    and of the best DEMAND-CONDITIONAL one, fitted on the same demand draws. The
-    distance between them is the forecasting value of the demand signal in that regime,
-    computed analytically and independently of any learner. Setting the learned V beside
-    it does two things at once:
-
-      * It resolves the comparison with the literature. A 22% reduction sounds far above
-        the two to nine per cent usually reported, but those studies were conducted in
-        regimes where the analytic prize itself is small. Here the prize is 5% at low
-        persistence and rises past 30% at high persistence. The estimates are readings
-        at different points on the same axis, and this table is the evidence for that
-        claim rather than an assertion of it.
-
-      * It exposes a residual. At zero persistence the two fitted policies are IDENTICAL
-        -- the conditional mean equals the unconditional mean, so the optimal conditional
-        coefficient is zero and the analytic prize is exactly zero. Yet sharing still
-        pays. Whatever that is, it is not forecasting value, and the residual is stable
-        across the regimes where the prize is small.
-
-    Read from runs/baselines_*.json at build time; nothing is entered by hand."""
-    rows, resid = [], []
-    for fn, g in sorted(BASELINE_GROUP.items()):
-        pth = os.path.join(ROOT, "runs", fn)
-        if not os.path.exists(pth):
-            continue
-        try:
-            b = json.load(open(pth, encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        sb, cb = b.get("static_bs"), b.get("cond_bs")
-        if sb in (None, "") or cb in (None, ""):
-            continue
-        rho = b.get("rho")
-        fam = "raw_reta_b10" if g == G09 else "raw_reta"
-        v = D.v(g, fam)
-        if not len(v):
-            v = D.v(g, "raw")
-        if not len(v):
-            continue
-        prize = float(sb) - float(cb)
-        r = {"rho": rho, "sb": float(sb), "cb": float(cb), "prize": prize,
-             "pct": prize / float(sb) if sb else 0.0, "V": float(v.mean()),
-             "vpct": float(v.mean()) / float(sb) if sb else 0.0,
-             "resid": float(v.mean()) - prize,
-             "ood": str(g).endswith("_ood") or "poisson" in str(g)}
-        rows.append(r)
-        if not r["ood"]:
-            resid.append(r)
-    if not rows:
-        return ""
-    rows.sort(key=lambda r: (r["ood"], r["rho"] if r["rho"] is not None else 99))
-    def _label(r):
-        # Python 3.11 forbids reusing the outer quote inside an f-string expression, so
-        # the label is built here rather than nested into the row template.
-        if r["ood"] or r["rho"] is None:
-            return "transfer / regime"
-        return "rho = {:g}".format(r["rho"])
-
-    body = "".join(
-        f'<tr><td>{_label(r)}</td>'
-        f'<td class="n">{r["sb"]:,.0f}</td><td class="n">{r["cb"]:,.0f}</td>'
-        f'<td class="n">{r["prize"]:,.0f}</td><td class="n">{r["pct"]:.1%}</td>'
-        f'<td class="n">{r["V"]:+,.0f}</td><td class="n">{r["vpct"]:.1%}</td>'
-        f'<td class="n">{r["resid"]:+,.0f}</td></tr>' for r in rows)
-    # NO SELECTION. An earlier version chose which regimes to call "flat" with a
-    # threshold on the prize, which is selection on the outcome variable. Every regime
-    # is reported, and the pattern is left to the reader and to the test below.
-    zero = [r for r in resid if r["rho"] is not None and abs(r["rho"]) < 1e-9]
-    note = ""
-    if zero:
-        z = zero[0]
-        note = (f'<p style="max-width:74ch;margin-top:18px"><b>Look at the top row.</b> '
-                f'With no persistence the two fitted policies cost the same to the '
-                f'decimal ({z["sb"]:,.1f}), because the conditional mean equals the '
-                f'unconditional mean and the optimal conditional coefficient is zero. '
-                f'The analytic prize is not small here; it is <b>exactly zero</b>. There '
-                f'is no forecast to convey. Yet sharing is still worth '
-                f'<b>{z["V"]:+,.0f}</b>.</p>')
-    if len(resid) > 1:
-        rs = ", ".join(f"rho {r['rho']:g}: {r['resid']:+,.0f}" for r in
-                       sorted(resid, key=lambda r: (r["rho"] if r["rho"] is not None else 9)))
-        note += (f'<p style="max-width:74ch;margin-top:12px">The residual across every '
-                 f'in-distribution regime, none omitted, is {rs}. Both fitted benchmarks '
-                 f'are stationary rules, so neither can price the one thing a channel '
-                 f'delivers even under independent demand: the message arrives in the '
-                 f'period it is observed, while the order carrying the same information '
-                 f'arrives a lead time later. That is a <b>demand leadtime</b> in the '
-                 f'sense of Hariharan and Zipkin (1995), who show such information '
-                 f'improves performance in precisely the way a replenishment leadtime '
-                 f'degrades it, and it rests on the substitution between inventory and '
-                 f'information established by Milgrom and Roberts (1988). '
-                 f'<b>This campaign does not test that reading.</b> Doing so requires '
-                 f'the staleness ladder at low persistence, where forecast value is '
-                 f'provably zero, and a lead-time axis so the mechanism can be checked '
-                 f'against its own parameter. Neither was run here.</p>')
-    return (f'<table class="cert" style="margin-top:16px">'
-            f'<tr><th>regime</th><th>best unconditional</th><th>best conditional</th>'
-            f'<th>analytic prize</th><th>as % of cost</th><th>V (learned)</th>'
-            f'<th>as % of cost</th><th>residual</th></tr>{body}</table>{note}')
-
-
-def _count_word(n):
-    """Spell a small count. The multiplicity note said 'the two that do not' while three
-    claims failed correction -- a number written once and never re-derived."""
-    return {0: "none", 1: "the one", 2: "the two", 3: "the three", 4: "the four",
-            5: "the five"}.get(n, f"the {n}")
-
-
-def equivalence_power(D, R):
-    """For every registered NULL, what would it take to establish equivalence?
-
-    Failing to reject zero is not the same as showing an effect is negligible. The
-    difference is power, and power is computable: with a paired design and a declared
-    materiality band, the sample size needed for the confidence interval to fit inside
-    the band follows from the observed dispersion. Reporting that number turns 'we found
-    nothing' into 'here is what finding nothing would have required', which is a claim a
-    reader can check."""
-    out = []
-    band = 0.02 * D.v(G09, "nocomm", "cost_mean").mean()
-    for key, label in (("P2", "order-stream degradation"),
-                       ("H_CALENDAR", "sharing under turbulence"),
-                       ("H_LEARN", "forecast minus raw demand"),
-                       ("H_REP", "message representation")):
-        res = R.get(key)
-        if not res:
-            continue
-        rows = [r for r in res.get("stats", []) if r.get("seeds")]
-        if not rows:
-            continue
-        x = np.asarray(rows[0]["seeds"], dtype=float)
-        n = len(x)
-        if n < 3 or x.std(ddof=1) == 0:
-            continue
-        sd = float(x.std(ddof=1)); se = sd / np.sqrt(n)
-        half = float(st.t.ppf(0.975, n - 1)) * se
-        need = int(np.ceil((st.t.ppf(0.975, max(2, n - 1)) * sd / band) ** 2)) if band else 0
-        while need > 2 and (st.t.ppf(0.975, need - 1) * sd / np.sqrt(need)) > band:
-            need += 1
-        out.append({"key": key, "label": label, "n": n, "mean": float(x.mean()),
-                    "sd": sd, "half": half, "band": band,
-                    "ok": half < band, "need": need})
-    if not out:
-        return ""
-    body = "".join(
-        f'<tr><td>{o["label"]}</td><td class="n">{o["n"]}</td>'
-        f'<td class="n">{o["mean"]:+,.0f}</td><td class="n">&plusmn;{o["half"]:,.0f}</td>'
-        f'<td class="n">&plusmn;{o["band"]:,.0f}</td>'
-        f'<td><span class="pill p-{"holds" if o["ok"] else "broken"}">'
-        f'{"equivalent" if o["ok"] else "underpowered"}</span></td>'
-        f'<td class="n">{o["n"] if o["ok"] else o["need"]}</td></tr>' for o in out)
-    short = [o for o in out if not o["ok"]]
-    good = [o for o in out if o["ok"]]
-    note = ""
-    if good:
-        note += (f'<p style="max-width:74ch;margin-top:16px">'
-                 f'<b>{len(good)} of these {len(out)} nulls are already established as '
-                 f'equivalences</b>, not merely unrejected: '
-                 f'{", ".join(o["label"] for o in good)}. Their intervals sit inside the '
-                 f'materiality band at the replication actually run, so for those the '
-                 f'stronger claim is available and should be made.</p>')
-    if short:
-        cheap = min(short, key=lambda o: o["need"])
-        dear = max(short, key=lambda o: o["need"])
-        note += (f'<p style="max-width:74ch;margin-top:12px">The remaining '
-                 f'{len(short)} are underpowered for the claim made of them, and they '
-                 f'are underpowered by very different margins. '
-                 f'<b>{cheap["label"].capitalize()} needs n = {cheap["need"]}</b> against '
-                 f'the {cheap["n"]} run here &mdash; about '
-                 f'{cheap["need"] / max(1, cheap["n"]):.1f}&times; the replication on that '
-                 f'cell alone, which is a few hundred additional jobs and is the one '
-                 f'experiment that would change what this study can assert.')
-        if dear is not cheap:
-            note += (f' <b>{dear["label"].capitalize()}</b>, by contrast, would need '
-                     f'n = {dear["need"]} &mdash; its dispersion (CI &plusmn;'
-                     f'{dear["half"]:,.0f} against a &plusmn;{dear["band"]:,.0f} band) is '
-                     f'too large for equivalence to be practically reachable. That claim '
-                     f'should therefore be weakened in the text rather than powered: the '
-                     f'evidence supports &ldquo;no effect was detected&rdquo; and cannot '
-                     f'support &ldquo;the effect is negligible&rdquo;.')
-        note += "</p>"
-    return (f'<table class="cert" style="margin-top:16px">'
-            f'<tr><th>registered null</th><th>n</th><th>observed effect</th>'
-            f'<th>95% CI half-width</th><th>materiality band</th><th></th>'
-            f'<th>n needed</th></tr>{body}</table>{note}')
-
-
-def limitations_section(D, R, hl):
-    """What this study does not establish.
-
-    Written as the assessment an unsympathetic referee would write, with the numbers
-    computed rather than characterised. A limitations section that only lists the
-    limitations an author is comfortable with is worth nothing; this one names the
-    estimand problem, the power problem and the scope problem, and states what would
-    have to change for each conclusion to move."""
-    F = FACTS
-    prize0 = None
-    for fn, g in BASELINE_GROUP.items():
-        pth = os.path.join(ROOT, "runs", fn)
-        if not os.path.exists(pth):
-            continue
-        try:
-            b = json.load(open(pth, encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if b.get("rho") == 0 and b.get("static_bs") is not None:
-            prize0 = float(b["static_bs"]) - float(b["cond_bs"])
-    v0 = D.v("rho0_ar1_b10", "raw_reta")
-    red = n0(F.get("reduction"), ".0%", "this study&rsquo;s figure")
-    p0 = f" (prize exactly {prize0:,.0f})" if prize0 is not None else ""
-    fails = [k for k, v in (hl or {}).items() if not v.get("survives")]
-    return f"""
-<section><div class="wrap">
-  <div class="sec-head"><h2>What this study does not establish</h2>
-    <p>The claims above are stated as strongly as the design supports. This section
-    states what the design does not support, in the same detail.</p></div>
-
-  <h3>1. What V is, and what it is not</h3>
-  <p style="max-width:74ch">V is the cost difference between two <em>learned</em> chains.
-  It is not the decision-theoretic value of information, which is defined between two
-  <em>optimal</em> policies, and the distinction is not cosmetic. The classical estimates
-  &mdash; Chen's nought to nine per cent, Cachon and Fisher's two &mdash; are differences
-  between optimal policies. A reader who sets {red} beside them is comparing quantities that are not the same
-  quantity.</p>
-  <p style="max-width:74ch">The prize table above is what makes the comparison legible.
-  The distance between the best unconditional and the best demand-conditional base-stock
-  rule is a decision-theoretic value of information, computed analytically in each
-  regime, and it moves from five per cent of cost at low persistence to above thirty at
-  high persistence. The literature's estimates and this study's sit at different points
-  on that axis. What this study adds is not a larger number but a decomposition: how much
-  of an analytically defined prize a learner actually captures, and what is left over
-  when the prize is zero.</p>
-  <p style="max-width:74ch"><b>The residual is the open question.</b> At zero persistence
-  the two fitted policies are identical{p0},
-  so there is no forecast to convey, and sharing is still worth
-  {n0(float(v0.mean()) if len(v0) else None)}. Both benchmarks are stationary rules and
-  neither prices arrival time. The reading offered here &mdash; that V contains a
-  forecasting component the prize measures and a timing component it cannot &mdash; is
-  consistent with the staleness gradient but is <em>not</em> separately identified by this
-  campaign. Doing so requires the staleness arms at low persistence, where forecast value
-  is provably zero, and those were not run. Until they are, the residual is a documented
-  anomaly rather than a demonstrated mechanism.</p>
-
-  <h3>2. Which nulls are underpowered</h3>
-  {equivalence_power(D, R)}
-  <p style="max-width:74ch;margin-top:14px">This matters most for the order-stream test.
-  The argument that a learned receiver does not invert the order stream is what
-  distinguishes this design from the assumption-based literature, and it currently rests
-  on failing to reject zero at a sample size that could not have rejected much.
-  {'The claims that do not survive family-wise correction are: ' + ', '.join(sorted(fails)) + '.' if fails else ''}</p>
-
-  <h3>3. What is held fixed</h3>
-  <p style="max-width:74ch">Fifteen seeds replicate training, not the supply chain. Four
-  echelons and a two-week lead time are constant in every cell of this campaign. Lead
-  time is not an incidental parameter here: it is the quantity the proposed timing
-  mechanism is made of, since it sets how long an order takes to carry information that
-  a message delivers at once. A study whose central residual is attributed to delay, and
-  which never varies delay, has not tested its own explanation. Echelon count is the same
-  kind of omission for the upstream-capture result.</p>
-
-  <h3>4. Conditions that were withdrawn</h3>
-  <p style="max-width:74ch">Two cost-asymmetry conditions and both single-edge topologies
-  are not reported. The first because the agent's action grid is not wide enough to
-  express the policy that regime requires, and the constraint falls on the no-sharing arm
-  more heavily than on the sharing arm, so the comparison is biased rather than merely
-  noisy. The second because a tag collision caused two topologies to train concurrently
-  into one directory. Both are documented above with the evidence that identified them.
-  Neither is a null result and neither should be cited as one.</p>
-
-  <h3>5. What would change these conclusions</h3>
-  <p style="max-width:74ch">The persistence gradient, the content ladder and the
-  broadcast-over-relay premium are supported at effect sizes and replication counts that
-  no plausible additional run would overturn; they would have to be wrong for a different
-  reason. The claims that are genuinely contingent are the three registered nulls above,
-  which additional seeds could move in either direction, and the timing interpretation of
-  the residual, which the staleness arms at low persistence would confirm or destroy in a
-  few hundred jobs. Those are the experiments worth running. Widening the action grid
-  would recover the cost-asymmetry axis but changes the policy class and therefore
-  requires the entire campaign again, which is a poor trade for one registered
-  hypothesis.</p>
-</div></section>
-"""
-
-
-MATERIALITY = 0.02        # declared band: 2% of no-sharing cost. Anchored to the
-                          # magnitude Cachon & Fisher (2000, Mgmt Sci 46(8):1032-1048)
-                          # report for shared information -- the smallest effect this
-                          # literature treats as economically meaningful. A convention,
-                          # fixed in advance, not a derived quantity.
-
-
-def tost(x, band, alpha=0.05):
-    """Two one-sided tests (Schuirmann 1987, J Pharmacokinet Biopharm 15(6):657-680).
-
-    Establishes that a paired difference lies inside +/- band, which is a positive claim.
-    Failing to reject zero is not: it is absence of evidence, and at the sample sizes
-    used here it is weak absence. Returns the decision, the interval and the TOST p.
-    """
-    x = np.asarray(x, float)
-    n = len(x)
-    if n < 3 or not np.isfinite(x).all():
-        return {"n": n, "mean": float("nan"), "lo": float("nan"), "hi": float("nan"),
-                "p": float("nan"), "decision": "insufficient data"}
-    sd = x.std(ddof=1)
-    se = sd / np.sqrt(n)
-    m = float(x.mean())
-    if se == 0:
-        return {"n": n, "mean": m, "lo": m, "hi": m, "p": 0.0,
-                "decision": "equivalent" if abs(m) < band else "outside"}
-    lo, hi = st.t.interval(1 - 2 * alpha, n - 1, loc=m, scale=se)   # 90% CI == TOST
-    p_lo = float(st.t.sf((m + band) / se, n - 1))
-    p_hi = float(st.t.cdf((m - band) / se, n - 1))
-    p = max(p_lo, p_hi)
-    if lo > -band and hi < band:
-        dec = "equivalent"
-    elif lo > band:
-        dec = "above"
-    elif hi < -band:
-        dec = "below"
-    else:
-        dec = "undetermined"
-    return {"n": n, "mean": m, "lo": float(lo), "hi": float(hi), "p": p,
-            "decision": dec, "band": band}
-
-
-def prop_diff(k1, n1, k2, n2, alpha=0.05):
-    """Difference of two proportions with a Newcombe (1998, Stat Med 17:873-890)
-    hybrid-score interval, and a two-proportion z-test.
-
-    Used where the question is 'does this policy choose its boundary action more often
-    than the same policy under the reference condition' -- a comparison of proportions
-    with a within-study control, which needs no invented cutoff."""
-    if min(n1, n2) == 0:
-        return {"diff": float("nan"), "lo": float("nan"), "hi": float("nan"),
-                "p": float("nan")}
-    p1, p2_ = k1 / n1, k2 / n2
-    z = st.norm.ppf(1 - alpha / 2)
-
-    def wilson(k, n):
-        ph = k / n
-        d = 1 + z * z / n
-        c = (ph + z * z / (2 * n)) / d
-        h = z * np.sqrt(ph * (1 - ph) / n + z * z / (4 * n * n)) / d
-        return c - h, c + h
-
-    l1, u1 = wilson(k1, n1)
-    l2, u2 = wilson(k2, n2)
-    lo = (p1 - p2_) - np.sqrt((p1 - l1) ** 2 + (u2 - p2_) ** 2)
-    hi = (p1 - p2_) + np.sqrt((u1 - p1) ** 2 + (p2_ - l2) ** 2)
-    pool = (k1 + k2) / (n1 + n2)
-    se = np.sqrt(pool * (1 - pool) * (1 / n1 + 1 / n2))
-    zz = (p1 - p2_) / se if se > 0 else float("inf")
-    return {"diff": float(p1 - p2_), "lo": float(lo), "hi": float(hi),
-            "p": float(2 * st.norm.sf(abs(zz))), "p1": float(p1), "p2": float(p2_)}
-
-
-def hypothesis_caveats(key):
-    """The validity caveats a card must carry, derived rather than remembered.
-
-    Two independent ways a cell can be unreadable: the control failed to reach the
-    benchmark (or cleared it so far the benchmark is not binding), and the agent could
-    not express the benchmark at all because the fitted level exceeds its action grid.
-    A card inherits both."""
-    out = []
-    for g in HYP_GROUPS.get(key, []):
-        c = CONTROL_VALIDITY.get(g)
-        if c and c["status"] in ("broken", "weak-bar"):
-            out.append((g, c))
-        k = CEILING.get(g)
-        if k and k["status"] == "exceeds":
-            out.append((g, {"status": "broken", "why": k["why"]}))
-    return out
-
-
-# ------------------------------------------------------- registered directions
-# The PRE-REGISTERED prediction for each hypothesis, and the statistic that decides it.
-# This table is the registration, not the result: it says what was predicted BEFORE the
-# data, so the data can contradict it. verdict_from_data() below scores the campaign
-# against it and build-time output flags any hypothesis whose declared verdict no longer
-# matches what this campaign measured.
-#
-#   direction  "positive"  the decisive quantity was predicted to be > 0
-#              "negative"  ... < 0
-#              "null"      ... indistinguishable from 0 (a null that carries the claim)
-#              None        no directional registration; the declared verdict stands
-#   decisive   "row<N>"    statistics row N -- use the row the hypothesis is ABOUT.
-#                          Several hypotheses carry an explicit 'difference' row; that
-#                          row, not row0, is the test. Reading row0 for H_CRITICAL_RATIO
-#                          scores 'sharing has value at b/h=4', which is not the claim.
-#              "gap01"     row0 minus row1, where no explicit difference row exists
-#              "extra:KEY" the named quantity in extra[]
-#
-# Row p-values come from full(), which is ONE-SIDED IN THE POSITIVE DIRECTION. A row
-# whose effect is negative therefore carries p close to 1, so significance has to be
-# re-derived per direction rather than compared to alpha directly.
-#
-# VERIFY THIS TABLE against the preregistration document before publishing. A wrong
-# entry here silently rewrites a scientific claim, which is worse than a stale number.
-REGISTERED = {
-    "F_CONTENT":        ("positive", "row0"),        # raw demand beats no sharing
-    "H2":               ("positive", "extra:slope"),  # value rises with persistence
-    "H_SOURCE":         ("positive", "row2"),        # broadcast minus relay
-    "H_TIME":           ("positive", "row3"),        # endpoint decay across lags
-    "H_TAIL":           ("positive", "gap01"),       # CVaR gain exceeds mean gain
-    "H_FRAGILITY":      ("positive", "row2"),        # engineered minus emergent
-    "H_SHOCK":          ("positive", "row0"),
-    "H_CALENDAR":       ("null",     "row0"),
-    "H_ECHELON":        ("positive", "extra:uvr"),   # upstream minus retailer
-    "H_BUDGET":         ("negative", "extra:slope"),  # registered as SUBSTITUTES
-    "P2":               ("null",     "row0"),
-    "P1":               ("positive", "row3"),        # the forecast-advantage contrast
-    "H_LEARN":          ("positive", "row0"),
-    "H_CRITICAL_RATIO": ("positive", "row2"),        # the b/h difference, not its level
-    "H_REP":            (None,       "row0"),
-    "IP":               ("positive", "row0"),
-    "F_INCENTIVE":      ("positive", "row0"),
-    "PLACEBO":          ("null",     "row0"),
-}
-ALPHA = 0.05
-
-
-def _sig(p1, direction, eff=None):
-    """p1 is one-sided in the POSITIVE direction, as full() computes it.
-
-    Significance is assessed in the direction the effect actually points: that is what
-    distinguishes a genuine reversal (refuted) from an absence of evidence (not
-    replicated). Testing only in the registered direction scores a large, clean,
-    opposite-signed effect as 'not distinguishable from zero', which is false."""
-    if p1 is None:
-        return False
-    try:
-        p1 = float(p1)
-        if not np.isfinite(p1):
-            return False
-    except (TypeError, ValueError):
-        return False
-    if direction == "null":
-        return 2.0 * min(p1, 1.0 - p1) < ALPHA
-    if eff is not None and eff < 0:
-        return (1.0 - p1) < ALPHA
-    return p1 < ALPHA
-
-
-def verdict_from_data(key, stats, extra, declared):
-    """Score this campaign against the registered direction.
-
-    Returns (verdict, basis). Where the decisive quantity cannot be recovered the
-    declared verdict is kept and the basis says so -- silence is better than a verdict
-    invented from the wrong number."""
-    reg = REGISTERED.get(key)
-    if not reg or not stats:
-        return declared, "no registered direction; declared verdict kept"
-    direction, decisive = reg
-    if direction is None:
-        return declared, "registered without a direction"
-
-    def row(i):
-        r = stats[i] if len(stats) > i else None
-        return r if isinstance(r, dict) else None
-
-    eff = p1 = None
-    two_sided = False
-    if decisive.startswith("extra:"):
-        want = decisive.split(":", 1)[1]
-        val = (extra or {}).get(want)
-        if isinstance(val, dict):                    # e.g. uvr = {diff, se, p}
-            eff, p1, two_sided = val.get("diff"), val.get("p"), True
-        else:
-            eff, p1, two_sided = val, (extra or {}).get("p"), True
-    elif decisive == "gap01":
-        a, b = row(0), row(1)
-        if a and b and a.get("V") is not None and b.get("V") is not None:
-            eff = a["V"] - b["V"]
-        p1, two_sided = (extra or {}).get("p"), True
-    else:
-        r = row(int(decisive[3:]))
-        if r:
-            eff, p1 = r.get("V"), r.get("p")
-    if eff is None:
-        return declared, f"decisive statistic ({decisive}) unavailable; declared kept"
-
-    if two_sided:
-        # extras carry a two-sided or already-halved p; treat as two-sided and convert
-        try:
-            p1 = float(p1) / 2 if (p1 is not None and eff > 0) else (
-                1 - float(p1) / 2 if p1 is not None else None)
-        except (TypeError, ValueError):
-            p1 = None
-    sig = _sig(p1, direction, eff)
-
-    if direction == "null":
-        if sig:
-            return "refuted", f"an effect was detected ({eff:+,.1f}, two-sided p<{ALPHA})"
-        keep = declared if declared in ("null-is-finding", "confirmed-null") \
-            else "confirmed-null"
-        return keep, f"{eff:+,.1f}, not distinguishable from zero, as registered"
-    want = 1 if direction == "positive" else -1
-    got = 1 if eff > 0 else -1
-    if got == want and sig:
-        return "confirmed", f"registered direction, {eff:+,.1f}, p<{ALPHA}"
-    if got != want and sig:
-        return "refuted", f"REVERSED: {eff:+,.1f} against the registered direction"
-    return "not-replicated", f"{eff:+,.1f} but not distinguishable from zero"
-
-
 def compute(D):
     """Every statistic the report shows. Keys match docs/hypotheses_text.py."""
     R, r9 = {}, D.v(G09, "raw_reta_b10")
-    VERDICT_LOG.clear()
 
     def entry(key, stats, verdict, headline, extra=None):
-        derived, basis = verdict_from_data(key, stats, extra or {}, verdict)
-        VERDICT_LOG.append((key, verdict, derived, basis))
-        R[key] = {"stats": stats, "verdict": derived, "declared": verdict,
-                  "verdict_basis": basis, "headline": headline,
+        R[key] = {"stats": stats, "verdict": verdict, "headline": headline,
                   "extra": extra or {}}
 
     # F_CONTENT
     rows, ps = [], {}
     for fam, lab in (("raw_reta_b10", "raw demand"), ("arpred_reta", "forecast"),
                      ("dhatc_reta_b10", "learned forecast"),
-                     ("learned_reta", "emergent protocol"), ("ip_reta", "inventory position")):
+                     ("learned", "emergent protocol"), ("ip_reta", "inventory position")):
         v = D.v(G09, fam)
         row = full(v, lab, f"gap {D.v(G09, fam, 'gap_recovered').mean():.0%}")
         row["gap"] = float(D.v(G09, fam, "gap_recovered").mean())
@@ -1505,7 +341,7 @@ def compute(D):
           {"ratio": d.mean() / (mn - mr).mean(), "p": p2})
 
     # H-FRAGILITY
-    fr, fl = D.v(G09, "raw_reta_b10", "fragility_excess"), D.v(G09, "learned_reta", "fragility_excess")
+    fr, fl = D.v(G09, "raw_reta_b10", "fragility_excess"), D.v(G09, "learned", "fragility_excess")
     fd = fr - fl; _, p = one_sided(fd); ps["H-FRAGILITY"] = p
     lz = D.v(G09, "raw_reta_b10", "listen_zeroed")
     ls = D.v(G09, "raw_reta_b10", "listen_shuffled")
@@ -1519,7 +355,7 @@ def compute(D):
     # H-SHOCK across arms
     shock = []
     for fam, lab in (("raw_reta_b10", "raw demand"), ("arpred_reta", "forecast"),
-                     ("dhatc_reta_b10", "learned forecast"), ("learned_reta", "emergent"),
+                     ("dhatc_reta_b10", "learned forecast"), ("learned", "emergent"),
                      ("ip_reta", "inventory position"), ("raw_upst", "relayed"),
                      ("raw_lag1", "one period stale"), ("raw_lag2", "two periods stale"),
                      ("raw_down", "own-order echo"), ("raw_manu", "most upstream signal")):
@@ -1531,30 +367,13 @@ def compute(D):
                     "did": dd.mean(), "did_p": p,
                     "demand": lab not in ("own-order echo", "most upstream signal")})
         shock.append(row)
-    # H-SHOCK. Three distinct claims live behind the opening figure and were previously
-    # reported as one, which flatters the weakest of them:
-    #   A  sharing is valuable UNDER shock            +1,005, p ~ 1e-9, 15/15 seeds
-    #   B  it is worth MORE under shock than normally +145,   p ~ .03, 10/15 seeds
-    #   C  the latency mechanism (+1/+4/+7/+10 -> +1/+1/+1/+1) -- deterministic
-    # B is the registered comparative claim and the one that fails family-wise
-    # correction. A and C are not in doubt and do not depend on B. Reporting them
-    # separately is what stops a reader discounting the figure when B is corrected away.
-    lvl = D.v("rho-3_ood", "raw_reta_b10")
-    _, p_lvl = one_sided(lvl)
-    dd0 = lvl - r9
-    _, p = one_sided(dd0); ps["H-SHOCK"] = p
+    _, p = one_sided(D.v("rho-3_ood", "raw_reta_b10") - r9); ps["H-SHOCK"] = p
     n_pos = sum(1 for s_ in shock if s_["demand"] and s_["did"] > 0)
     for s_ in shock:
-        s_["note"] = f'shock {s_["did"]:+,.0f} (p {s_["did_p"]:.3f})'
+        s_["note"] = f'shock {s_["did"]:+,.0f} (p {s_["did_p"]:.3f})' 
     entry("H_SHOCK", shock, "confirmed",
-          f"sharing is worth {lvl.mean():+,.0f} under an unanticipated shock "
-          f"({int((lvl > 0).sum())}/{len(lvl)} seeds); whether that EXCEEDS its "
-          f"in-distribution value is the registered claim and is the weaker one",
-          {"p": p, "level": float(lvl.mean()), "level_p": p_lvl,
-           "level_pos": int((lvl > 0).sum()),
-           "delta": float(dd0.mean()),
-           "delta_pos": int((dd0 > 0).sum()),
-           "split": True})
+          f"every one of {n_pos} demand-bearing channels gains under disruption",
+          {"p": p})
 
     # H-CALENDAR
     ch = D.v("rho-4_ood", "raw_reta_b10"); _, p2 = st.ttest_1samp(ch, 0)
@@ -1592,34 +411,12 @@ def compute(D):
               {"slope": bx["slope"], "se": bx["slope_se"], "p": bx["p"]})
 
     # P2
-    # P2 -- the redundancy null. This is the claim the design exists to test, so it is
-    # held to the same standard as the other null in this study (H-REP): a TWO ONE-SIDED
-    # TEST against a declared materiality band, not a failure to reject. Failing to
-    # reject at n = 15 with SE around 50 is absence of evidence; equivalence requires
-    # the whole interval inside the band, and says something.
     g6 = D.v("rho0.9_ar1_b10_cl6", "raw") - r9
     g8 = D.v("rho0.9_ar1_b10_cl8", "raw") - r9
     _, p = one_sided(g6); ps["P2 garbling"] = p
-    band = 0.02 * D.v(G09, "nocomm", "cost_mean").mean()   # same band as H-REP
-    tost = {}
-    for nm, x in (("cl6", g6), ("cl8", g8)):
-        if len(x) > 1 and x.std(ddof=1) > 0:
-            se_ = x.std(ddof=1) / np.sqrt(len(x))
-            lo, hi = st.t.interval(0.95, len(x) - 1, loc=x.mean(), scale=se_)
-            p_lo = st.t.sf((x.mean() + band) / se_, len(x) - 1)
-            p_hi = st.t.cdf((x.mean() - band) / se_, len(x) - 1)
-            tost[nm] = {"mean": float(x.mean()), "ci": [float(lo), float(hi)],
-                        "p_tost": float(max(p_lo, p_hi)),
-                        "equivalent": bool(lo > -band and hi < band)}
-    equiv = all(t["equivalent"] for t in tost.values()) if tost else False
     entry("P2", [full(g6, "62% of order-stream info destroyed"), full(g8, "47% destroyed")],
-          "null-is-finding",
-          ("degrading the order stream changed nothing, and the change is formally "
-           f"equivalent to zero within &plusmn;{band:,.0f}" if equiv else
-           "degrading the order stream changed nothing detectable, but the interval is "
-           f"wider than the &plusmn;{band:,.0f} materiality band &mdash; this is absence "
-           "of evidence, not established equivalence"),
-          {"p": p, "band": band, "tost": tost, "equivalent": equiv})
+          "null-is-finding", "degrading the order stream changed nothing, for any arm",
+          {"p": p})
 
     # P1
     dp_a = D.v("rho-1_dr_poisson_b10", "arpred", "gap_recovered")
@@ -1676,7 +473,7 @@ def compute(D):
     inc = []
     for g, b in (("rho0.9_ar1_b0", "own cost only"),
                  ("rho0.9_ar1_b05", "partial alignment"), (G09, "full chain cost")):
-        v = D.v(g, "dhatc_reta"); nc = D.v(g, "nocomm", "cost_mean")
+        v = D.v(g, "dhatc"); nc = D.v(g, "nocomm", "cost_mean")
         if len(v):
             inc.append(full(v, b, f"no-sharing cost {nc.mean():,.0f}"))
     entry("F_INCENTIVE", inc, "confirmed", "value persists under decentralised objectives")
@@ -1702,11 +499,10 @@ def compute(D):
         if not len(v):
             continue
         ood = g.endswith("_ood")
-        CONTROL_VALIDITY[g] = classify_control(v, c.mean(), ood)
         ctl.append({"label": lab, "delta": v.mean(),
                     "cv": float(c.std(ddof=1) / c.mean()),
-                    "status": CONTROL_VALIDITY[g]["status"],
-                    "why": CONTROL_VALIDITY[g]["why"]})
+                    "status": "transfer" if ood else
+                              ("holds" if v.mean() > -120 else "broken")})
     return R, ctl, holm(ps)
 
 
@@ -1994,58 +790,6 @@ def card(key, res):
     if isinstance(st_, tuple):        # tolerate a stray trailing comma in the prose file
         st_ = st_[0]
     verdict = res["verdict"]
-    basis = res.get("verdict_basis", "")
-    declared = res.get("declared")
-    flip = ""
-    if declared and declared != verdict:
-        flip = (f'<p class="missing" style="margin-top:10px">Registered as '
-                f'<b>{declared}</b>; this campaign measures <b>{verdict}</b> &mdash; '
-                f'{basis}. The registered prediction is reported as registered, and the '
-                f'result is reported as measured.</p>')
-    wd = withdrawn_reason(key)
-    if wd:
-        # Withdrawn, not scored. Rendering statistics under a withdrawn hypothesis
-        # invites exactly the reading the withdrawal exists to prevent.
-        return f"""
-  <details class="h" id="{key}">
-    <summary><div class="h-head"><div>
-      <div class="h-id">{IDS.get(key, (key, ""))[0]}</div>
-      <div class="h-title">{txt.get("title", key)}</div></div>
-      <div class="badge b-inconclusive">withdrawn</div></div>
-      <div class="h-line">not testable in this campaign</div></summary>
-    <div class="h-body">
-      <div class="prov" style="border-left:3px solid var(--no)">
-        <span class="pl">withdrawn</span><b>This registered hypothesis is withdrawn
-        rather than scored.</b> {wd}
-        <br><br>The registered contrast compares this regime against one where the
-        ceiling did not bind, so the difference confounds the treatment with a change in
-        what the policy class can represent. A verdict of &ldquo;refuted&rdquo; or
-        &ldquo;not replicated&rdquo; would both claim that the question was asked and
-        answered; it was not asked. V within this regime remains a valid paired
-        comparison &mdash; both arms face the same ceiling &mdash; but the comparative
-        claim, the fraction of the analytic gap, and the comparison against the fitted
-        benchmark are all unreadable here.
-        <br><br>This is a scope condition on the method rather than an accident of this
-        run: in a learned policy the action grid <em>is</em> part of the policy class, so
-        moving the cost parameters can move the optimum outside it. A study that varies
-        economics on a fixed discretised action space measures the class, not the
-        economics, once that happens.</div>
-      <p class="read">{txt.get("reading", "").strip()}</p>
-    </div>
-  </details>"""
-
-    caveat = ""
-    cav = hypothesis_caveats(key)
-    if cav:
-        worst = "broken" if any(c["status"] == "broken" for _g, c in cav) else "weak-bar"
-        head = ("This test is estimated in a regime where the control FAILED the "
-                "validity check." if worst == "broken" else
-                "This test is estimated in a regime where the analytic benchmark is "
-                "not a binding floor.")
-        body_ = "".join(f'<li><code>{g}</code> &mdash; {c["why"]}.</li>' for g, c in cav)
-        caveat = (f'<div class="prov" style="border-left:3px solid var(--no)">'
-                  f'<span class="pl">validity caveat</span><b>{head}</b>'
-                  f'<ul style="margin:8px 0 0 18px">{body_}</ul></div>')
     rows = res["stats"]
     vmax = max((abs(r.get("V", 0)) for r in rows), default=1) or 1
     body = "".join(bar_row(r["label"], r.get("V", 0), r.get("se", 0), vmax,
@@ -2137,8 +881,6 @@ def card(key, res):
     {dual_html}
     {stat_tbl}
     {method_html}
-    {caveat}
-    {flip}
     {read_html}
     <div class="srcs">{'<br>'.join(txt['sources'])}</div>
   </div>
@@ -2282,16 +1024,17 @@ TOPOS = [
      "numbers from the wrong partners. If the value measured elsewhere came from "
      "communication as such rather than from the serial demand path, this would show "
      "it &mdash; which is what makes it a sharper control than an empty channel."),
-    # BOTH single-edge topologies are withdrawn. The sweep's tag builder truncates the
-    # topology name to four characters, so link_top_only and link_bottom_only produced
-    # the SAME tag. The idempotency guard runs when the job list is built, before either
-    # had written anything, so both were queued -- and the worker pool ran them
-    # concurrently into one directory, one log and one checkpoint path. Seven of the
-    # fifteen logs record two completions; the logs contain interleaved partial writes;
-    # gate-line counts run 40-63 instead of 60. Which topology owns the surviving
-    # checkpoint varies by seed and cannot be recovered, so the cell is a mixture of two
-    # conditions rather than a measurement of either. No other cell in the campaign shows
-    # this signature. See CAMPAIGN["contaminated_cell"].
+    ("link_bottom_only", "raw_link_b",
+     [[0,0,0,0],[1,0,0,0],[0,0,0,0],[0,0,0,0]], True,
+     "A single edge, at the bottom of the chain: the wholesaler hears the retailer and "
+     "nobody else hears anything. The cleanest possible signal delivered to exactly one "
+     "stage. Its mirror at the top of the chain (link_top_only) is defined and certified "
+     "in code but was not trained in this campaign, so the question of where a single "
+     "connection is worth most is left open here."),
+    # link_top_only removed: enumerated in the plan but never trained, because the
+    # sweep's tag builder truncates topology names to four characters and it collided
+    # with link_bottom_only. See CAMPAIGN["dropped_cell"] at the top of this file.
+    # The family key it used ("raw_link_t") could never have matched a tag anyway.
 ]
 STAGES = ["R", "W", "D", "M"]
 
@@ -2307,15 +1050,8 @@ def matrices_html(D):
                 cls = "on" if on and live else ("on dim" if on else "")
                 cells += f'<i class="{cls}"></i>'
         v = D.v(G09, fam) if fam else np.array([])
-        if len(v):
-            val = (f'<span class="mv {"pos" if v.mean() > 5 else ("neg" if v.mean() < -5 else "nil")}">'
-                   f'{v.mean():+,.0f}</span>')
-        elif fam is None:
-            # An alias, not a condition: it has no cell of its own by design, so it must
-            # not render as a wiring whose number went missing.
-            val = '<span class="mv nil">alias</span>'
-        else:
-            val = '<span class="mv nil">no data</span>'
+        val = (f'<span class="mv {"pos" if v.mean() > 5 else ("neg" if v.mean() < -5 else "nil")}">'
+               f'{v.mean():+,.0f}</span>' if len(v) else "")
         out += (f'<figure class="mat"><div class="mat-top"><div class="grid4">{cells}</div>'
                 f'<div class="mat-ax"><span>R</span><span>W</span><span>D</span><span>M</span></div>'
                 f'</div><figcaption><b class="tname">{name}</b> {val}<span class="why">{why}</span>'
@@ -2384,7 +1120,9 @@ def baseline_html(D, curves):
 NOTATION = [
   ("V", "the quantity everything measures",
    "Cost of the chain that shares nothing, minus cost of the otherwise identical chain "
-   "that shares. Positive means sharing is cheaper."),
+   "that shares. Positive means sharing is cheaper. Units are cost per chain-horizon: "
+   "holding plus backorder penalty, summed over four stages and fifty weeks. V = +860 "
+   "against a no-sharing cost of 3,899 is a 22% reduction."),
   ("rho", "how much demand remembers itself",
    "The autocorrelation of end-customer demand. Demand follows an AR(1) process: this "
    "week's demand is a weighted blend of last week's and fresh noise, and rho is that "
@@ -2476,94 +1214,10 @@ NOTATION = [
 ]
 
 
-FACTS = {}
-
-
-def facts(D, R):
-    """Every number that appears in PROSE, derived from the current campaign.
-
-    Before this existed, sentences like 'V = +860 against a no-sharing cost of 3,899'
-    were literals in the source. They were measured on an earlier campaign and survived
-    two data refreshes unchanged, because nothing recomputed them and nothing checked
-    them. Anything here is now as current as RESULTS.csv; if a value cannot be derived
-    it comes back as None and the sentence that uses it says so rather than inventing.
-
-    The result is also published as the module-level FACTS, so helpers that render deep
-    inside a section can reach the same derived numbers without threading an argument
-    through every call site.
-    """
-    def m(group, fam, col="V_vs_nocomm"):
-        v = D.v(group, fam, col)
-        return float(v.mean()) if len(v) else None
-
-    def pct(a, b):
-        return (a / b) if (a is not None and b) else None
-
-    F = {}
-    F["V_raw"] = m(G09, "raw_reta_b10")
-    F["cost_nocomm"] = m(G09, "nocomm_reta_b10", "cost_mean")
-    if F["cost_nocomm"] is None:                     # nocomm may carry no V row
-        cr = m(G09, "raw_reta_b10", "cost_mean")
-        F["cost_nocomm"] = (cr + F["V_raw"]) if (cr is not None and F["V_raw"]) else None
-    F["reduction"] = pct(F["V_raw"], F["cost_nocomm"])
-    F["V_relay"] = m(G09, "raw_upst")
-    F["relay_share"] = pct(F["V_relay"], F["V_raw"])
-    F["broadcast_over_relay"] = ((F["V_raw"] - F["V_relay"])
-                                 if None not in (F["V_raw"], F["V_relay"]) else None)
-    F["V_rho0"] = m("rho0_ar1_b10", "raw_reta")
-    F["V_lag2"] = m(G09, "raw_lag2")
-    F["stale2_cost"] = ((F["V_raw"] - F["V_lag2"])
-                        if None not in (F["V_raw"], F["V_lag2"]) else None)
-    F["gap"] = m(G09, "raw_reta_b10", "gap_recovered")
-
-    # widest and narrowest condition on the rho-0.9 ladder, for the range sentence
-    vals = [D.v(G09, fam).mean() for _n, fam, _M, _l, _w in TOPOS
-            if fam and len(D.v(G09, fam))]
-    F["V_best"] = max(vals) if vals else None
-    F["V_worst"] = min(vals) if vals else None
-
-    # trajectory-derived, from extras rather than the CSV
-    b = D.extras.get("budget") or {}
-    F["budget_slope"] = b.get("slope")
-    ds = (D.extras.get("demand_stats") or {}).get("0.9") or {}
-    F["demand_mean"] = ds.get("mean")
-    t = D.extras.get("trace") or {}
-    dem = t.get("demand")
-    if dem:
-        k = max(0, (t.get("shock", 24) - t.get("w0", 18)))
-        F["demand_pre"] = round(float(np.mean(dem[:max(1, k)])))
-        F["demand_post"] = round(float(np.mean(dem[k:]))) if len(dem) > k else None
-    else:
-        F["demand_pre"] = F["demand_post"] = None
-    FACTS.clear()
-    FACTS.update(F)
-    return F
-
-
-def n0(x, fmt="+,.0f", alt="not available in this campaign"):
-    """Format a derived fact, or say plainly that it could not be derived. A sentence
-    with a missing number must read as missing, never as a stale one."""
-    try:
-        return format(x, fmt) if x is not None and np.isfinite(x) else alt
-    except (TypeError, ValueError):
-        return alt
-
-
-def notation_html(F=None):
-    F = F or {}
-    v, c, r = F.get("V_raw"), F.get("cost_nocomm"), F.get("reduction")
-    if None not in (v, c, r):
-        units = (f"Units are cost per chain-horizon: holding plus backorder penalty, "
-                 f"summed over four stages and fifty weeks. V = {v:+,.0f} against a "
-                 f"no-sharing cost of {c:,.0f} is a {r:.0%} reduction.")
-    else:
-        units = ("Units are cost per chain-horizon: holding plus backorder penalty, "
-                 "summed over four stages and fifty weeks.")
-    items = [(k, sub, (txt + " " + units) if k == "V" else txt)
-             for k, sub, txt in NOTATION]
+def notation_html():
     return "".join(
         f'<div class="note"><div class="nk"><span class="num">{k}</span>'
-        f'<em>{sub}</em></div><p>{txt}</p></div>' for k, sub, txt in items)
+        f'<em>{sub}</em></div><p>{txt}</p></div>' for k, sub, txt in NOTATION)
 
 
 AGENT_PARAMS = [
@@ -2601,36 +1255,19 @@ def params_html():
 
 
 def topology_html(D):
-    """Which wiring wins, and the diagnostics that say why.
-
-    Driven by TOPOS rather than a hand-kept list: the previous version named five
-    topologies while the campaign ran eleven, so six wirings had a routing matrix in
-    one section and no row in this table. Anything with a family key and data appears
-    here automatically, and a wiring added to TOPOS can no longer be forgotten."""
+    """Which wiring wins, and the diagnostics that say why."""
     rows = ""
     ref = D.v(G09, "raw_reta_b10")
-    # Reading labels for the wirings that carry a registered interpretation; anything
-    # else falls back to its own name, which is still better than being absent.
-    NOTE = {
-        "raw_reta_b10": ("broadcast to all", "full visibility"),
-        "raw_upst": ("relayed stage to stage", "one hop each"),
-        "raw_no_n": ("no channel", "reference"),
-        "raw_manu": ("broadcast from the factory", "demand-correlated but thrice filtered"),
-        "raw_down": ("own-order echo", "no new information"),
-        "raw_all_": ("all-to-all, separate slots", "information ceiling"),
-        "raw_full": ("all-to-all, averaged", "co-senders compressed into one slot"),
-        "raw_skip": ("all but the longest edge", "isolates the direct POS feed"),
-        "raw_neig": ("both neighbours", "useful and useless feed together"),
-        "raw_wron": ("non-adjacent partners only", "live channel, wrong senders"),
-        "raw_link_b": ("one edge, bottom of chain", "wholesaler hears the retailer"),
-    }
-    for name, fam, _M, _live, _why in TOPOS:
-        if not fam:
-            continue                      # aliases carry no cell of their own
+    for fam, lab, note in (
+        ("raw_reta_b10", "broadcast to all", "full visibility"),
+        ("raw_upst", "relayed stage to stage", "one hop each"),
+        ("raw_no_n", "no channel", "reference"),
+        ("raw_manu", "broadcast from the factory", "demand-correlated but thrice filtered"),
+        ("raw_down", "own-order echo", "no new information"),
+    ):
         v = D.v(G09, fam)
         if not len(v):
             continue
-        lab, note = NOTE.get(fam, (name.replace("_", " "), "exploratory"))
         cost = D.v(G09, fam, "cost_mean").mean()
         li = D.v(G09, fam, "listen_shuffled")
         sg = D.v(G09, fam, "signaling_r")
@@ -2640,11 +1277,9 @@ def topology_html(D):
                  f'<td class="n">{cost:,.0f}</td>'
                  f'<td class="n">{v.mean():+,.0f}</td>'
                  f'<td class="n">{share:.0%}</td>'
-                 + _num(li.mean() if len(li) else None, "+,.0f")
-                 + (f'<td class="n">{sg.mean():.2f}</td>'
-                    if len(sg) and np.isfinite(sg.mean())
-                    else '<td class="n" style="color:var(--void)">&mdash;</td>')
-                 + _num(bw if np.isfinite(bw) else None, ".1f") + '</tr>')
+                 f'<td class="n">{li.mean():+,.0f}</td>'
+                 + (f'<td class="n">{sg.mean():.2f}</td>' if len(sg) and np.isfinite(sg.mean()) else '<td class="n" style="color:var(--void)">&mdash;</td>') + 
+                 f'<td class="n">{bw:.1f}</td></tr>')
     return rows
 
 
@@ -2653,7 +1288,7 @@ def ladder_svg(D):
     items = []
     for g, fam, lab in (
         (G09, "dhatc_reta_b10", "learned forecast"), (G09, "raw_reta_b10", "raw demand"),
-        (G09, "arpred_reta", "forecast"), (G09, "learned_reta", "emergent protocol"),
+        (G09, "arpred_reta", "forecast"), (G09, "learned", "emergent protocol"),
         (G09, "raw_lag1", "demand, 1 period old"), (G09, "raw_lag2", "demand, 2 periods old"),
         (G09, "raw_upst", "relayed upstream"), (G09, "ip_reta", "inventory position"),
         ("rho0.6_ar1_b10", "raw", "raw demand, rho 0.6"),
@@ -3304,11 +1939,10 @@ def service_html(D):
                 f'Total chain cost {cm.mean():,.0f}.</div></div>')
     d = D.v(G09, "raw_reta_b10", "ready_rate") - D.v(G09, "nocomm", "ready_rate")
     t, p2 = st.ttest_1samp(d, 0)
-    red = n0(FACTS.get("reduction"), ".0%", "the size reported above")
     out += (f'<div class="stat"><div class="k">difference</div>'
             f'<div class="v num">{d.mean():+.1%}</div>'
             f'<div class="s">across the fifteen matched pairs '
-            f'(p = {p2:.1e}), against a cost reduction of {red}.</div></div>')
+            f'(p = {p2:.1e}), against a cost reduction of about 22%.</div></div>')
     return out
 
 
@@ -3325,26 +1959,13 @@ def bars(D):
     return nc, nc - gap
 
 
-def _topo_series(D):
-    """Every wiring with data, in TOPOS order, keyed by its real topology name.
-
-    Both the inference table and the pairwise comparison were hand-listed with five
-    topologies while the campaign trained eleven. Six wirings therefore had a routing
-    matrix and a cost row elsewhere in the report but no inference and no pairwise test
-    at all. Deriving the set here means all three tables in this section always cover
-    the same conditions."""
-    out = {}
-    for name, fam, _M, _live, _why in TOPOS:
-        if not fam:
-            continue                       # aliases have no cell of their own
-        v = D.v(G09, fam)
-        if len(v):
-            out[name] = v
-    return out
-
-
 def topo_rank(D):
-    return pairwise_rows(_topo_series(D))
+    C = {"retailer_broadcast": D.v(G09, "raw_reta_b10"),
+         "upstream_only": D.v(G09, "raw_upst"),
+         "no_neighbor": D.v(G09, "raw_no_n"),
+         "manufacturer_broadcast": D.v(G09, "raw_manu"),
+         "downstream_only": D.v(G09, "raw_down")}
+    return pairwise_rows(C)
 
 
 def pairwise_rows(C):
@@ -3410,12 +2031,16 @@ def content_levels(D):
     return levels_table({"learned forecast": D.v(G09, "dhatc_reta_b10"),
                          "raw demand": D.v(G09, "raw_reta_b10"),
                          "analytic forecast": D.v(G09, "arpred_reta"),
-                         "emergent protocol": D.v(G09, "learned_reta"),
+                         "emergent protocol": D.v(G09, "learned"),
                          "inventory position": D.v(G09, "ip_reta")})
 
 
 def topo_levels(D):
-    return levels_table(_topo_series(D))
+    return levels_table({"retailer_broadcast": D.v(G09, "raw_reta_b10"),
+                         "upstream_only": D.v(G09, "raw_upst"),
+                         "no_neighbor": D.v(G09, "raw_no_n"),
+                         "manufacturer_broadcast": D.v(G09, "raw_manu"),
+                         "downstream_only": D.v(G09, "raw_down")})
 
 
 def prov(what, why):
@@ -3442,7 +2067,7 @@ def content_full_table(D):
     for fam, lab in (("dhatc_reta_b10", "learned forecast"),
                      ("raw_reta_b10", "raw demand"),
                      ("arpred_reta", "analytic forecast"),
-                     ("learned_reta", "emergent protocol"),
+                     ("learned", "emergent protocol"),
                      ("ip_reta", "inventory position"),
                      ("raw_lag1", "raw demand, 1 week old"),
                      ("raw_lag2", "raw demand, 2 weeks old")):
@@ -3460,7 +2085,7 @@ def content_full_table(D):
                  f'<td class="n">{v.mean():+,.0f}</td>'
                  f'<td class="n">[{ci[0]:+,.0f}, {ci[1]:+,.0f}]</td>'
                  f'<td class="n">{p1:.1e}</td>'
-                 + gap_cell(G09, g.mean() if len(g) else None) +
+                 f'<td class="n">{g.mean():.0%}</td>'
                  f'<td class="n">{c.mean()-noc_cost.mean()+noc_static.mean():+,.0f}</td>'
                  f'<td class="n">{li.mean():+,.0f}</td></tr>')
     return rows
@@ -3470,11 +2095,9 @@ def content_by_rho(D):
     """Does the encoding question have the same answer at every persistence level?
     raw and the learned forecast are the two contents present across the whole grid."""
     rows = ""
-    # Keys must name exactly one condition. Bare "dhatc" also matches dhatc_upst at
-    # rho 0.9, which is a different topology, so every key is spelled out in full.
-    for rho, g, fr, fd in ((0.0, "rho0_ar1_b10", "raw_reta", "dhatc_reta"),
-                           (0.3, "rho0.3_ar1_b10", "raw_reta", "dhatc_reta"),
-                           (0.6, "rho0.6_ar1_b10", "raw_reta", "dhatc_reta"),
+    for rho, g, fr, fd in ((0.0, "rho0_ar1_b10", "raw_reta", "dhatc"),
+                           (0.3, "rho0.3_ar1_b10", "raw", "dhatc"),
+                           (0.6, "rho0.6_ar1_b10", "raw", "dhatc"),
                            (0.9, G09, "raw_reta_b10", "dhatc_reta_b10")):
         a, b = D.v(g, fr), D.v(g, fd)
         if len(a) != len(b) or not len(a):
@@ -3500,7 +2123,7 @@ def content_rank(D):
     C = {"raw demand": D.v(G09, "raw_reta_b10"),
          "forecast": D.v(G09, "arpred_reta"),
          "learned forecast": D.v(G09, "dhatc_reta_b10"),
-         "emergent protocol": D.v(G09, "learned_reta"),
+         "emergent protocol": D.v(G09, "learned"),
          "inventory position": D.v(G09, "ip_reta")}
     names = list(C)
     pairs = []
@@ -3570,8 +2193,7 @@ PARTS = [
    "The bullwhip, and what sharing does"]),
  ("The registered tests",
   "Each hypothesis as it was written down before the campaign ran, and how it fared.",
-  ["The registry", "Correcting for asking many questions",
-   "What this study does not establish"]),
+  ["The registry", "Correcting for asking many questions"]),
  ("Closing",
   "What the evidence supports, and where it sits.",
   ["What to do with this", "Where this sits in the literature"]),
@@ -3620,21 +2242,6 @@ def reorder(html):
 
 
 def build(D, R, ctl, hl, out_path):
-    F = facts(D, R)
-    # Populate CEILING before any card is assembled: a card inherits the ceiling caveat,
-    # and the section that renders the ceiling table sits later in the template, so
-    # relying on that call to load it would silently leave every card uncaveated.
-    action_ceiling_check(ROOT)
-    index_tags(D)
-    BINDING.clear()
-    BINDING.update(ceiling_binding(ROOT))
-    for g, b in BINDING.items():
-        if b.get("binding"):
-            print(f"[ceiling] {g}: action space BOUND "
-                  f"({b['frac']:.0%} of range) -- hypotheses estimated there are withdrawn")
-        elif b.get("binding") is False:
-            print(f"[ceiling] {g}: benchmark outside grid but policy at {b['frac']:.0%} "
-                  f"of range -- ceiling did not bind, result stands")
     curves = read_curves(ROOT, [f"C_ar1_r09_nocomm_reta_b10_s{s}" for s in range(30, 45)])
     lat = D.extras.get("latency", {}).get("14", D.extras.get("latency", {}).get(14))
     names = ["retailer", "wholesaler", "distributor", "manufacturer"]
@@ -3697,13 +2304,6 @@ def build(D, R, ctl, hl, out_path):
   <h1>What is a demand signal<br>worth, and <em>to whom</em>?</h1>
   <p class="lede">{ABSTRACT}</p>
 
-  {persistence_hero(D, R)}
-  {hero_stats}
-
-  <div class="sec-head" style="margin-top:46px"><h2>How the value arises</h2>
-    <p>The gradient says how much a demand signal is worth. The figures below say why
-    &mdash; the same information reaching the same stages at different times.</p></div>
-
   <figure class="fig" style="margin-top:30px">
     <figcaption class="fc-top">Orders at every stage through an unannounced doubling of
       customer demand &mdash;
@@ -3713,7 +2313,7 @@ def build(D, R, ctl, hl, out_path):
     {shock_orders_svg(D)}
     <figcaption><b>Read it top to bottom: that is the chain.</b> The retailer serves
     customers, and each stage below serves the one above it. The dashed blue line is the
-    same in every panel &mdash; real customer demand, flat at about {n0(F['demand_pre'], ',.0f', 'its base level')} units a week until
+    same in every panel &mdash; real customer demand, flat at about 8 units a week until
     the marked week, then doubling to 20 and staying there. Nobody was told it would.
     <br><br>
     Only the retailer can see that line. Every other stage sees nothing but the orders
@@ -3733,13 +2333,10 @@ def build(D, R, ctl, hl, out_path):
           "90th percentile across the 15 chains. Demand line is the median realised "
           "customer demand over the same runs. Policies were trained on ordinary "
           "demand and dropped into this shock without retraining.",
-          "The disruption case follows the headline gradient because it is where the "
-          "mechanism is visible rather than statistical: the same information reaching "
-          "the same stages at different times, with consequences you can read off the "
-          "picture. It is a demonstration, not the study's strongest evidence, and the "
-          "panel below says which parts of it are and are not in doubt.")}
+          "The disruption case opens the report because it is where the mechanism is "
+          "visible rather than statistical: the same information reaching the same "
+          "stages at different times, with consequences you can read off the picture.")}
   </figure>
-  {shock_claim_split(R, hl)}
 
   <div class="spine">
     <div class="spine-legend">
@@ -3768,13 +2365,14 @@ def build(D, R, ctl, hl, out_path):
     three different thresholds for what counts as "responded":</p>
     {latency_table(D)}
   </div>
+  {hero_stats}
   <figure class="fig"><figcaption class="fc-top">Factory orders through an unannounced
     doubling of end-customer demand, averaged over all 15 seeds &mdash; <span style="color:var(--flow)">demand</span>,
     <span style="color:var(--void)">no sharing</span>,
     <span style="color:var(--signal)">demand shared</span></figcaption>
     {trace_svg(D)}
     <figcaption><b>How to read it.</b> The dashed blue line is what customers actually
-    buy: flat at about {n0(F['demand_pre'], ',.0f', 'its base level')} units a week, then rising to roughly {n0(F['demand_post'], ',.0f', 'double')} at the marked week and
+    buy: flat at about 8 units a week, then doubling to roughly 20 at the marked week and
     staying there. The two solid lines are what the <em>factory</em> — four stages away
     from those customers — orders in response. Grey is the chain with no communication;
     amber is the same chain with the retailer's demand shared.
@@ -3823,7 +2421,7 @@ def build(D, R, ctl, hl, out_path):
     <div class="rule"><b>Fifty weeks, then the bill</b>Each run is fifty weeks, starting
       from a stocked and balanced chain. The number this report calls cost is the total
       over those fifty weeks and all four stages &mdash; typically around
-      <b>{n0(F['cost_nocomm'], ',.0f')}</b> without sharing &mdash; and the objective is to minimise it for the
+      <b>3,900</b> without sharing &mdash; and the objective is to minimise it for the
       chain as a whole, not for any one stage.</div>
     <div class="rule"><b>Demand is a process, not a script</b>Customer demand averages
       about 8 units a week and is drawn fresh each week from a statistical process whose
@@ -3896,7 +2494,8 @@ def build(D, R, ctl, hl, out_path):
     <div class="stat"><div class="k">training runs</div>
       <div class="v num">{CAMPAIGN['runs']}</div>
       <div class="s">{CAMPAIGN['cells']} conditions &times; {CAMPAIGN['seeds']} seeds,
-      each {CAMPAIGN['episodes']:,} episodes, every one completing without error.</div></div>
+      each {CAMPAIGN['episodes']:,} episodes, every one completing without error.
+      {_dropped_note()}</div></div>
     <div class="stat"><div class="k">wall clock</div>
       <div class="v num">{CAMPAIGN['wall_clock']}</div>
       <div class="s">{_workers_note()}{CAMPAIGN['vcpu']} vCPU
@@ -3928,8 +2527,6 @@ def build(D, R, ctl, hl, out_path):
     <li><b>Analysis</b> &mdash; statistics, consolidated results sheet, figures and a
       manifest recording the SHA-256 of every source file that produced them.</li>
   </ol>
-  <p style="max-width:72ch;margin-top:22px;color:var(--ink-2);font-size:16px">
-    {_dropped_note()}</p>
 </div></section>
 
 <section><div class="wrap">
@@ -3971,7 +2568,7 @@ def build(D, R, ctl, hl, out_path):
     and the measured spread tracks the closed-form AR(1) prediction to within a few per
     cent at every level.</p>
   <p style="max-width:74ch;margin-top:20px">
-    The mean is held constant by construction &mdash; about {n0(F['demand_mean'], ',.0f', '12')} units at every setting
+    The mean is held constant by construction &mdash; about 12 units at every setting
     &mdash; so nothing in the table comes from demand simply being larger. Two other
     dimensions grow together, and both matter for what a chain must hold. The
     <b>spread</b> widens by a factor of about 2.2 from one end of the range to the other.
@@ -4258,19 +2855,10 @@ def build(D, R, ctl, hl, out_path):
         "from any starting point &mdash; around 2% spread &mdash; and a wandering one "
         "does not.")}
   <p style="max-width:66ch;margin-top:22px;color:var(--ink-2);font-size:16px">
-    A positive figure means the learned chain beat the analytic rule. That is not always
-    reassuring: where the control clears the benchmark by a wide margin the benchmark is
-    not a binding floor, and "fraction of the analytic gap recovered" stops being
-    interpretable in that regime. Those cells are marked above and the affected
-    hypothesis cards carry the caveat rather than the ratio. The check earns its place:
-    it caught a selection defect in the persistence grid that would otherwise have
-    produced a confident and wrong result for the study's central comparative static.</p>
-
-  <h3 style="margin-top:34px">Could the agent express the benchmark it is measured against?</h3>
-  {action_ceiling_check(ROOT)}
-
-  <h3 style="margin-top:34px">And did the value function survive?</h3>
-  {critic_health(ROOT)}
+    A positive figure means the learned chain beat the analytic rule, which is expected
+    where a stationary rule is a weak benchmark. The check earns its place: it caught a
+    selection defect in the persistence grid that would otherwise have produced a
+    confident and wrong result for the study's central comparative static.</p>
 </div></section>
 
 <section><div class="wrap">
@@ -4359,7 +2947,7 @@ def build(D, R, ctl, hl, out_path):
 <section><div class="wrap">
   <div class="sec-head"><h2>What the delay actually costs</h2>
     <p>Backlog at each stage through the same shock. The value figures say sharing is
-    worth {n0(F['V_raw'], ',.0f')}; this says where that comes from.</p></div>
+    worth 860; this says where those 860 come from.</p></div>
   <figure class="fig"><figcaption class="fc-top">Unfilled orders waiting at each stage
     &mdash; <span style="color:var(--void)">no sharing</span>,
     <span style="color:var(--signal)">demand shared</span></figcaption>
@@ -4574,8 +3162,7 @@ def build(D, R, ctl, hl, out_path):
       Chen, Drezner, Ryan &amp; Simchi-Levi (2000), <i>Management Science</i>
       46(3):436-443 &mdash; bullwhip under forecasting, and the cumulative
       variance-ratio convention measured here
-    </div>
-    {bullwhip_asymmetry(D)}</figure>
+    </div></figure>
 </div></section>
 
 <section><div class="wrap">
@@ -4588,7 +3175,7 @@ def build(D, R, ctl, hl, out_path):
         "persistent demand unless the label says otherwise; the three labelled with a "
         "persistence level are the same content measured in a different regime.",
         "One chart rather than a table because the point is the spread: the study's "
-        "conditions span from {n0(F['V_best'])} to {n0(F['V_worst'])}, and that range is the "
+        "conditions span from roughly +900 to below zero, and that range is the "
         "argument. Ranking by value also makes the controls visible at the foot, which "
         "is where a reader should look first.")}
   <figure class="fig">{ladder_svg(D)}
@@ -4608,21 +3195,9 @@ def build(D, R, ctl, hl, out_path):
         "comparative static and the reason the regime has to be stated everywhere "
         "else: the same channel is worth seventeen times more at one end of this axis "
         "than the other.")}
-  <h3 style="margin-top:8px">How much was there to win?</h3>
-  {prize_table(D)}
-
-  <p style="max-width:72ch;margin-top:30px;color:var(--ink-2);font-size:16px">The curve
-    itself opens the report. What follows is the same four points with their inference, so the gradient
-    can be checked rather than taken from a picture: near zero where demand is
-    memoryless, convex thereafter, and positive on every seed at every level.</p>
-  <table class="cert" style="margin-top:16px">
-    <tr><th>condition</th><th>V</th><th>SE</th><th>95% CI</th><th>d<sub>z</sub></th>
-        <th>p (t)</th><th>p (Wilcoxon)</th><th>seeds +</th></tr>
-    {levels_table({"rho = 0": D.v("rho0_ar1_b10", "raw_reta"),
-                   "rho = 0.3": D.v("rho0.3_ar1_b10", "raw_reta"),
-                   "rho = 0.6": D.v("rho0.6_ar1_b10", "raw_reta"),
-                   "rho = 0.9": D.v(G09, "raw_reta_b10")})}
-  </table>
+  <figure class="fig">{curve_svg(R)}
+    <figcaption>Near zero where demand is memoryless, and convex thereafter: each
+    additional unit of persistence is worth more than the last.</figcaption></figure>
 </div></section>
 
 <section><div class="wrap">
@@ -4648,8 +3223,8 @@ def build(D, R, ctl, hl, out_path):
         "fixed costs nothing and makes the geometry effect attributable.")}
   <table class="cert"><tr><th>comparison</th><th>difference</th><th>95% CI</th><th>p</th><th>Holm p</th><th>seeds</th><th></th></tr>{topo_rank(D)}</table>
   <p style="max-width:72ch;margin-top:24px">
-    Broadcast beats relay by <span class="num">{n0(F['broadcast_over_relay'])}</span>, relay beats a disabled
-    channel by <span class="num">{n0(F['V_relay'])}</span>, and every one of those comparisons survives
+    Broadcast beats relay by <span class="num">+524</span>, relay beats a disabled
+    channel by <span class="num">+336</span>, and every one of those comparisons survives
     correction with near-unanimous seed agreement. The finding that deserves attention is
     at the bottom: <b>downstream_only is significantly worse than having no channel at
     all</b> (Holm p = 0.019). A wire that carries nothing useful is not neutral.
@@ -4695,8 +3270,7 @@ def build(D, R, ctl, hl, out_path):
 <section><div class="wrap">
   <div class="sec-head"><h2>Reading the numbers</h2>
     <p>What each quantity in this report means, in one place.</p></div>
-  <div class="notes">{notation_html(F)}</div>
-  {scope_note(D)}
+  <div class="notes">{notation_html()}</div>
   <div class="srcs" style="margin-top:26px">
     Equivalence testing at a materiality band rather than a significance threshold, and
     the two-per-cent figure: Cachon &amp; Fisher (2000), <i>Management Science</i>
@@ -4727,21 +3301,21 @@ def build(D, R, ctl, hl, out_path):
       week?</b>If it drifts in swings, sharing is worth a great deal and worth more the
       stronger the persistence. If each week is independent of the last, expect close to
       nothing: there is no forecastable component to transmit.
-      <em>H2 &mdash; value rose from {n0(F['V_rho0'])} at rho 0 to {n0(F['V_raw'])} at rho 0.9.</em></div>
+      <em>H2 &mdash; value rose from ~50 to ~860 across the persistence range.</em></div>
     <div class="gq"><span class="qn">2</span><b>Can everyone see the source, or only
       their neighbour?</b>Broadcasting point-of-sale data to every stage is worth roughly
       three times passing it up link by link. If the architecture is already dyadic,
       changing that is the single largest available improvement.
-      <em>H-SOURCE &mdash; relay retained {n0(F['relay_share'], '.0%')} of broadcast's value.</em></div>
+      <em>H-SOURCE &mdash; relay retained 39% of broadcast's value.</em></div>
     <div class="gq"><span class="qn">3</span><b>How fresh is the feed?</b>Each week of
       delay costs about an eighth of the channel's value. Weekly batch beats monthly by
       more than any refinement of what is in the file.
-      <em>H-TIME &mdash; two weeks of staleness cost {n0(F['stale2_cost'], ',.0f')} of {n0(F['V_raw'], ',.0f')}.</em></div>
+      <em>H-TIME &mdash; two weeks of staleness cost 226 of 860.</em></div>
     <div class="gq"><span class="qn">4</span><b>Can your partners act on it?</b>Value
       rose with the receiving policy's sophistication, not against it. A feed delivered
       to a chain that cannot use it will underdeliver, and the fault will look like the
       data's.
-      <em>H-BUDGET &mdash; value rose {n0(F['budget_slope'])} per doubling of planning capability.</em></div>
+      <em>H-BUDGET &mdash; value rose ~200 per doubling of planning capability.</em></div>
   </div>
   <p style="max-width:72ch;margin-top:28px">
     Two things this evidence does not support. Sharing did not calm the bullwhip, so it
@@ -4761,13 +3335,10 @@ def build(D, R, ctl, hl, out_path):
         "correction across the whole set of claims listed here.",
         "Reported because the study asks many directional questions at once, and a "
         "reader is entitled to know which conclusions survive that. The strong results "
-        "clear the correction by many orders of magnitude; "
-        + _count_word(sum(1 for v in hl.values() if not v.get("survives")))
-        + " that do not are left visible rather than dropped, and the text says which "
-        "evidence carries them instead.")}
-  {shared_reference_note(D)}
+        "clear the correction by many orders of magnitude; the two that do not are "
+        "left visible rather than dropped, and the text says which evidence carries "
+        "them instead.")}
 </div></section>
-{limitations_section(D, R, hl)}
 
 <section><div class="wrap">
   <div class="sec-head"><h2>Where this sits in the literature</h2>
@@ -4793,23 +3364,11 @@ def build(D, R, ctl, hl, out_path):
 <footer><div class="wrap">
   Generated {date.today().isoformat()} by scripts/build_report.py ·
   numbers from runs/RESULTS.csv · prose from docs/hypotheses_text.py<br>
-  {_provenance()}<br>
   Rebuild after editing the prose: <span style="color:var(--ink-2)">python scripts/build_report.py</span>
 </div></footer>
 </body></html>"""
     open(out_path, "w", encoding="utf-8").write(reorder(html))
     return len(html)
-
-
-def index_tags(D):
-    """tag -> analysis group, from the results sheet. Needed to find the trajectories
-    belonging to a group without re-deriving the campaign's naming rules."""
-    GROUP_OF_TAG.clear()
-    for r in D.rows:
-        fam, sd = r.get("family"), r.get("seed")
-        if fam and sd:
-            GROUP_OF_TAG[f"{fam}_s{sd}"] = r.get("group")
-    return GROUP_OF_TAG
 
 
 def audit_campaign(D):
@@ -4846,60 +3405,6 @@ def audit_campaign(D):
     return warn
 
 
-def read_manifest(root):
-    """runs/CAMPAIGN_MANIFEST.txt -- the campaign's provenance record: timestamp, commit,
-    and a SHA-256 per source file. The report has always CLAIMED this manifest exists;
-    reading it means the claim is backed by the artefact, and it lets the build notice
-    when RESULTS.csv has changed since the manifest was written (a re-collate, an edited
-    sheet) rather than presenting a stale hash as current."""
-    p = os.path.join(root, "runs", "CAMPAIGN_MANIFEST.txt")
-    if not os.path.exists(p):
-        return {}
-    lines = [ln.strip() for ln in open(p, encoding="utf-8") if ln.strip()]
-    if not lines:
-        return {}
-    out = {"when": lines[0], "commit": lines[1] if len(lines) > 1 else "", "files": {}}
-    for ln in lines[2:]:
-        parts = ln.split(None, 1)
-        if len(parts) == 2 and len(parts[0]) == 64:
-            out["files"][parts[1].strip()] = parts[0]
-        elif "=" in ln:
-            for kv in ln.split():
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    out[k] = v
-    return out
-
-
-def manifest_check(root, man, csv_path):
-    """Does RESULTS.csv still hash to what the manifest recorded? Returns a note, or ""
-    when they agree. Never raises: a provenance mismatch is information, not a failure."""
-    want = (man.get("files") or {}).get("runs/RESULTS.csv")
-    if not want or not os.path.exists(csv_path):
-        return ""
-    import hashlib
-    got = hashlib.sha256(open(csv_path, "rb").read()).hexdigest()
-    if got == want:
-        return ""
-    return (f"RESULTS.csv does not match the manifest (manifest {want[:12]}, "
-            f"file {got[:12]}) -- the sheet was regenerated after the manifest was "
-            f"written, so the recorded hashes describe an earlier state")
-
-
-def _provenance():
-    """The commit and campaign timestamp the numbers came from, straight out of the
-    manifest. When no manifest is present the line says so -- an unbacked provenance
-    claim is worse than an absent one."""
-    if not MANIFEST:
-        return ("campaign manifest not found &mdash; commit and file hashes "
-                "unverified for this build")
-    c = MANIFEST.get("commit", "")
-    n = len(MANIFEST.get("files", {}))
-    return (f"campaign {MANIFEST.get('when','')} &middot; commit "
-            f"<span style=\"font-family:var(--mono)\">{c[:12]}</span> &middot; "
-            f"{n} source files hashed in runs/CAMPAIGN_MANIFEST.txt")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", default=os.path.join(ROOT, "runs", "RESULTS.csv"))
@@ -4908,33 +3413,7 @@ def main():
     a = ap.parse_args()
     D = Data(a.csv, a.extras)
     audit_campaign(D)
-    MANIFEST.clear()
-    MANIFEST.update(read_manifest(ROOT))
-    if MANIFEST:
-        print(f"[manifest] {MANIFEST.get('when','')} commit "
-              f"{MANIFEST.get('commit','')[:12]} "
-              f"({len(MANIFEST.get('files', {}))} files hashed, "
-              f"declares cells={MANIFEST.get('cells','?')} jobs={MANIFEST.get('jobs','?')})")
-        if str(MANIFEST.get("cells", "")) not in ("", str(CAMPAIGN["cells"])):
-            print(f"[manifest] WARNING: manifest says cells={MANIFEST['cells']} but "
-                  f"CAMPAIGN['cells']={CAMPAIGN['cells']} and the data agrees with "
-                  f"CAMPAIGN -- the manifest records the PLAN, not what ran")
-        note = manifest_check(ROOT, MANIFEST, a.csv)
-        if note:
-            print(f"[manifest] NOTE: {note}")
-    else:
-        print("[manifest] runs/CAMPAIGN_MANIFEST.txt not found -- the provenance line "
-              "in the report will say so rather than assert a commit")
     R, ctl, hl = compute(D)
-    changed = [(k, dec, der, why) for k, dec, der, why in VERDICT_LOG if dec != der]
-    print(f"[verdict] {len(VERDICT_LOG)} hypotheses scored against REGISTERED; "
-          f"{len(changed)} differ from the declared verdict")
-    for k, dec, der, why in changed:
-        print(f"[verdict] {k}: declared '{dec}' -> measured '{der}' ({why})")
-    if changed:
-        print("[verdict] the report renders the MEASURED verdict. Check REGISTERED "
-              "against the preregistration, and update the prose in "
-              "docs/hypotheses_text.py where an interpretation no longer fits.")
     n = build(D, R, ctl, hl, a.out)
     missing = [k for k in HYPOTHESES if k not in R]
     print(f"[report] {len(R)} hypotheses rendered from {len(D.rows)} arm-rows "

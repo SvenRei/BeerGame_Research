@@ -1,0 +1,75 @@
+{
+ "root": "C:\\Users\\sven\\OneDrive\\Desktop\\Beer_Game_Project_10",
+ "config_keys": [
+  "act_bins",
+  "anneal_episodes",
+  "ar1_mu",
+  "ar1_sigma",
+  "backorder_cost",
+  "batch_episodes",
+  "beta",
+  "budget_milestones",
+  "canary_after",
+  "content",
+  "demand_family",
+  "dr_lambda_hi",
+  "dr_lambda_lo",
+  "ent_end",
+  "ent_start",
+  "eps_clip",
+  "ev_canary",
+  "forecaster_path",
+  "gamma",
+  "gate_episodes_per_rho",
+  "gate_every",
+  "hidden",
+  "holding_cost",
+  "k_epochs",
+  "lr_actor",
+  "lr_critic",
+  "lr_step_episodes",
+  "max_grad_norm",
+  "max_order",
+  "msg_dim",
+  "msg_scale",
+  "obs_order_clip",
+  "poisson_mu",
+  "rho",
+  "s_max",
+  "seed",
+  "select_on",
+  "select_smooth",
+  "tag",
+  "topology",
+  "total_episodes",
+  "warm_up"
+ ],
+ "config_matches": {
+  "action_grid_max": [
+   "s_max"
+  ],
+  "action_grid_bins": [],
+  "lead_time": [],
+  "n_echelons": [],
+  "warmup": [],
+  "init_bias": []
+ },
+ "env_constants": {
+  "MAX_DELAY": 15,
+  "AGENTS": [
+   "retailer",
+   "wholesaler",
+   "distributor",
+   "manufacturer"
+  ],
+  "N_AGENTS": 4,
+  "OBS_DIM": 4,
+  "PIPE_SLOTS": 15,
+  "STATE_DIM": 133
+ },
+ "agent_constants": {
+  "N_AGENTS": 4,
+  "OBS_DIM": 4,
+  "STATE_DIM": 133
+ }
+}

@@ -21,3 +21,7 @@ docs/extras.json
 docs/hypotheses_text.py
 docs/report.html
 traj_20260813T050758Z.tar.gz
+signal_analysis.tgz
+signal_archives.sha256
+signal_ckpts.tgz
+signal_traj.tgz
